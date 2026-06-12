@@ -103,14 +103,18 @@ func defaultLocalFirstLedger() (*localFirstLedger, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+
+	// SQLite connection string with pragmas to ensure they apply to all connections
+	// Using query parameters ensures each connection gets the same settings
+	connStr := path + "?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&cache=shared"
+	db, err := sql.Open("sqlite", connStr)
 	if err != nil {
 		return nil, err
 	}
-	// Increase connection pool for better concurrency with WAL mode
-	// WAL mode allows multiple readers and one writer simultaneously
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(2)
+	// Keep conservative connection pool to avoid "database is locked" errors
+	// WAL mode helps, but too many concurrent writers can still cause issues
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
 	db.SetConnMaxIdleTime(10 * time.Minute)
 
@@ -157,7 +161,7 @@ func (l *localFirstLedger) init(ctx context.Context) error {
 		`PRAGMA journal_mode=WAL`,
 		`PRAGMA synchronous=NORMAL`,
 		`PRAGMA busy_timeout=5000`, // 5 second lock timeout
-		`PRAGMA cache_size=-64000`,  // 64MB cache
+		`PRAGMA cache_size=-64000`, // 64MB cache
 		`CREATE TABLE IF NOT EXISTS local_usage_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			request_id TEXT NOT NULL,

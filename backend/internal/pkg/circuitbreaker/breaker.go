@@ -15,9 +15,9 @@ var (
 type State int
 
 const (
-	StateClosed State = iota // Normal operation
-	StateOpen                // Circuit is open, requests are rejected
-	StateHalfOpen            // Testing if service has recovered
+	StateClosed   State = iota // Normal operation
+	StateOpen                  // Circuit is open, requests are rejected
+	StateHalfOpen              // Testing if service has recovered
 )
 
 func (s State) String() string {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/circuitbreaker"
 	"github.com/dgraph-io/ristretto"
 )
 
@@ -165,33 +166,38 @@ func (s *APIKeyService) deleteAuthCache(ctx context.Context, cacheKey string) {
 
 func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey string) (*APIKeyAuthCacheEntry, error) {
 	// Add timeout for DB query to prevent long blocking
-	queryCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	// Use 2s instead of 500ms to avoid false positives from cold connections and network jitter
+	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	// Check circuit breaker before querying DB
-	if s.dbCircuitBreaker != nil && s.dbCircuitBreaker.IsOpen() {
-		// Circuit is open, try to use stale cache
-		if stale := s.getStaleCacheEntry(cacheKey); stale != nil {
-			return stale, nil
-		}
-		return nil, fmt.Errorf("circuit breaker open and no stale cache available")
-	}
-
+	// Use circuit breaker's AllowRequest instead of IsOpen to enable half-open testing
 	var dbErr error
-	apiKey, err := s.apiKeyRepo.GetByKeyForAuth(queryCtx, key)
-	dbErr = err
-
-	// Record circuit breaker metrics
+	var apiKey *APIKey
 	if s.dbCircuitBreaker != nil {
-		if err != nil {
-			s.dbCircuitBreaker.RecordFailure()
-		} else {
-			s.dbCircuitBreaker.RecordSuccess()
+		err := s.dbCircuitBreaker.Call(func() error {
+			var e error
+			apiKey, e = s.apiKeyRepo.GetByKeyForAuth(queryCtx, key)
+			dbErr = e
+			// Only record connection/timeout errors as circuit breaker failures
+			// Other errors (like auth errors) should not trigger the breaker
+			if e != nil && !errors.Is(e, ErrAPIKeyNotFound) && isTimeoutOrConnectionError(e) {
+				return e
+			}
+			return nil
+		})
+		// Circuit breaker rejected the request (open state)
+		if err == circuitbreaker.ErrCircuitOpen {
+			if stale := s.getStaleCacheEntry(cacheKey); stale != nil {
+				return stale, nil
+			}
+			return nil, fmt.Errorf("circuit breaker open and no stale cache available")
 		}
+	} else {
+		apiKey, dbErr = s.apiKeyRepo.GetByKeyForAuth(queryCtx, key)
 	}
 
-	if err != nil {
-		if errors.Is(err, ErrAPIKeyNotFound) {
+	if dbErr != nil {
+		if errors.Is(dbErr, ErrAPIKeyNotFound) {
 			entry := &APIKeyAuthCacheEntry{NotFound: true}
 			if s.authCfg.negativeEnabled() {
 				s.setAuthCacheEntry(ctx, cacheKey, entry, s.authCfg.negativeTTL)
@@ -206,7 +212,7 @@ func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey st
 			}
 		}
 
-		return nil, fmt.Errorf("get api key: %w", err)
+		return nil, fmt.Errorf("get api key: %w", dbErr)
 	}
 	apiKey.Key = key
 	snapshot := s.snapshotFromAPIKey(ctx, apiKey)
