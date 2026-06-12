@@ -16,6 +16,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/circuitbreaker"
 	"github.com/dgraph-io/ristretto"
 	"golang.org/x/sync/singleflight"
 )
@@ -210,6 +211,7 @@ type APIKeyService struct {
 	authAdjustLocks       sync.Map // cacheKey -> *sync.Mutex
 	lastUsedTouchL1       sync.Map // keyID -> nextAllowedAt(time.Time)
 	lastUsedTouchSF       singleflight.Group
+	dbCircuitBreaker      *circuitbreaker.CircuitBreaker // circuit breaker for DB queries
 }
 
 // NewAPIKeyService 创建API Key服务实例
@@ -230,6 +232,12 @@ func NewAPIKeyService(
 		userGroupRateRepo: userGroupRateRepo,
 		cache:             cache,
 		cfg:               cfg,
+		dbCircuitBreaker: circuitbreaker.New(circuitbreaker.Config{
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			Timeout:          30 * time.Second,
+			HalfOpenMaxCalls: 3,
+		}),
 	}
 	svc.initAuthCache(cfg)
 	return svc

@@ -107,8 +107,12 @@ func defaultLocalFirstLedger() (*localFirstLedger, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// Increase connection pool for better concurrency with WAL mode
+	// WAL mode allows multiple readers and one writer simultaneously
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(time.Hour)
+	db.SetConnMaxIdleTime(10 * time.Minute)
 
 	ledger := &localFirstLedger{
 		db:            db,
@@ -152,6 +156,8 @@ func (l *localFirstLedger) init(ctx context.Context) error {
 	stmts := []string{
 		`PRAGMA journal_mode=WAL`,
 		`PRAGMA synchronous=NORMAL`,
+		`PRAGMA busy_timeout=5000`, // 5 second lock timeout
+		`PRAGMA cache_size=-64000`,  // 64MB cache
 		`CREATE TABLE IF NOT EXISTS local_usage_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			request_id TEXT NOT NULL,

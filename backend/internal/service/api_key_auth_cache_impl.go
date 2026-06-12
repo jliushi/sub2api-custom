@@ -164,7 +164,32 @@ func (s *APIKeyService) deleteAuthCache(ctx context.Context, cacheKey string) {
 }
 
 func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey string) (*APIKeyAuthCacheEntry, error) {
-	apiKey, err := s.apiKeyRepo.GetByKeyForAuth(ctx, key)
+	// Add timeout for DB query to prevent long blocking
+	queryCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	// Check circuit breaker before querying DB
+	if s.dbCircuitBreaker != nil && s.dbCircuitBreaker.IsOpen() {
+		// Circuit is open, try to use stale cache
+		if stale := s.getStaleCacheEntry(cacheKey); stale != nil {
+			return stale, nil
+		}
+		return nil, fmt.Errorf("circuit breaker open and no stale cache available")
+	}
+
+	var dbErr error
+	apiKey, err := s.apiKeyRepo.GetByKeyForAuth(queryCtx, key)
+	dbErr = err
+
+	// Record circuit breaker metrics
+	if s.dbCircuitBreaker != nil {
+		if err != nil {
+			s.dbCircuitBreaker.RecordFailure()
+		} else {
+			s.dbCircuitBreaker.RecordSuccess()
+		}
+	}
+
 	if err != nil {
 		if errors.Is(err, ErrAPIKeyNotFound) {
 			entry := &APIKeyAuthCacheEntry{NotFound: true}
@@ -173,6 +198,14 @@ func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey st
 			}
 			return entry, nil
 		}
+
+		// On timeout or connection error, try stale cache
+		if isTimeoutOrConnectionError(dbErr) {
+			if stale := s.getStaleCacheEntry(cacheKey); stale != nil {
+				return stale, nil
+			}
+		}
+
 		return nil, fmt.Errorf("get api key: %w", err)
 	}
 	apiKey.Key = key
