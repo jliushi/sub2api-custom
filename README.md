@@ -1,5 +1,38 @@
 # Sub2API
 
+## 二开版本说明
+
+这个仓库是基于 upstream `Wei-Shaw/sub2api` 的二开版本，当前基线同步到 upstream `0.1.136`，并加入了面向 Hugging Face Space + Supabase 部署场景的稳定性和低数据库流量优化。
+
+### 这版做了什么
+
+- **本地优先 billing 账本**：请求完成后的 usage log 和 billing 扣费先写入本地 SQLite，再按周期批量 flush 到 Supabase。
+- **实时扣费约束不等 flush**：本地未 flush 的 billing delta 会叠加到 API key auth cache，避免用户余额/API key quota 在一小时 flush 窗口内失真。
+- **手动 billing flush 接口**：新增 `POST /api/v1/admin/billing/local-first/flush`，部署、重启、维护前后可以主动同步本地账本。
+- **Scheduler snapshot 主动刷新**：新增 `POST /api/v1/admin/scheduler/snapshot/refresh`，可手动刷新调度快照。
+- **Admin 恢复操作后自动刷新调度快照**：`recover-state`、`clear-error`、`batch-clear-error`、`clear-rate-limit`、`clear temp-unschedulable`、`set schedulable` 后会刷新相关账号/分组的 scheduler snapshot。
+- **OpenAI no available 自愈**：OpenAI 调度出现 `no available accounts` 时，会触发一次受 cooldown 和 singleflight 保护的 snapshot refresh，然后重试一次调度，避免 stale snapshot 导致服务卡住一小时。
+- **设置读取缓存**：对 settings 读取增加缓存，减少热路径对数据库的重复读取。
+- **可选 GitHub 加密备份**：提供 local billing ledger 和 admin data 的 GitHub 加密备份能力，默认应按实际部署策略显式启用。
+- **HF Space 持久化适配**：部署脚本支持把本地 billing SQLite 和 Redis 数据放到 `/data`，便于配合 Hugging Face persistent storage。
+
+### 主要优点
+
+- **降低 Supabase 压力**：正常请求路径不再每次都直接写 usage/billing 到 Supabase，改为本地写入 + 批量同步。
+- **减少 503 卡死窗口**：账号状态已经恢复但 scheduler snapshot 仍旧过期时，可以自动或手动刷新，不需要等一小时缓存自然过期。
+- **更少丢数据风险**：本地 billing 账本支持主动 flush、周期 flush、退出前 flush，并可配合 `/data` 持久化和 GitHub 加密备份。
+- **改动集中**：核心改动集中在 billing ledger、auth cache overlay、scheduler snapshot refresh 和 admin maintenance endpoint，尽量不改业务主流程。
+- **适合低成本部署**：对 HF Space + Supabase 这类资源受限部署更友好，减少数据库连接和写入压力。
+
+### 运维建议
+
+- Hugging Face Space 建议启用 persistent storage，并确保 `DATA_DIR` 指向 `/data/sub2api-data`。
+- 重启或部署后建议主动调用：
+  - `POST /api/v1/admin/billing/local-first/flush`
+  - `POST /api/v1/admin/scheduler/snapshot/refresh`
+- 如果启用 GitHub 备份，请使用独立 token 和私有备份仓库，并妥善保存加密密钥。
+- 公开仓库不要提交任何真实 Supabase、HF、GitHub、admin token 或上游 API key。
+
 <div align="center">
 
 [![Go](https://img.shields.io/badge/Go-1.25.7-00ADD8.svg)](https://golang.org/)
