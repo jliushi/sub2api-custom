@@ -2,6 +2,7 @@ package circuitbreaker
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -186,5 +187,55 @@ func TestCircuitBreaker_HalfOpenMaxCalls(t *testing.T) {
 	// Should reject third request
 	if cb.AllowRequest() {
 		t.Fatal("Should not allow third request")
+	}
+}
+
+// TestCircuitBreaker_ConcurrentAccess hammers the breaker from many goroutines
+// to surface data races on its shared counters/state. It is only meaningful
+// under `go test -race`; the assertions just confirm the breaker never lands
+// in an illegal state.
+func TestCircuitBreaker_ConcurrentAccess(t *testing.T) {
+	// Tiny timeout so the breaker churns through open -> half-open -> closed
+	// transitions while goroutines hammer it concurrently.
+	cb := New(Config{
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		Timeout:          time.Millisecond,
+		HalfOpenMaxCalls: 3,
+	})
+
+	const goroutines = 64
+	const iterations = 500
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				// Deterministic success/failure mix keeps the test reproducible
+				// while still driving every state transition.
+				_ = cb.Call(func() error {
+					if (id+i)%3 == 0 {
+						return errors.New("boom")
+					}
+					return nil
+				})
+				// Concurrent readers must race cleanly against the writers above.
+				_ = cb.State()
+				_ = cb.IsOpen()
+				if i%97 == 0 {
+					cb.Reset()
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	switch cb.State() {
+	case StateClosed, StateOpen, StateHalfOpen:
+		// legal terminal state
+	default:
+		t.Fatalf("unexpected state after concurrent access: %v", cb.State())
 	}
 }

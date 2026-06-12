@@ -104,9 +104,12 @@ func defaultLocalFirstLedger() (*localFirstLedger, error) {
 		return nil, err
 	}
 
-	// SQLite connection string with pragmas using modernc.org/sqlite syntax
-	// Using _pragma parameters ensures each connection gets the same settings
-	connStr := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=cache_size(-64000)&cache=shared"
+	// SQLite connection string with pragmas using modernc.org/sqlite syntax.
+	// Using _pragma parameters ensures each connection gets the same settings.
+	// No cache=shared: with a single connection it gives no benefit and can
+	// surface SQLITE_LOCKED ("database table is locked"), which busy_timeout
+	// does not cover.
+	connStr := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=cache_size(-64000)"
 	db, err := sql.Open("sqlite", connStr)
 	if err != nil {
 		return nil, err
