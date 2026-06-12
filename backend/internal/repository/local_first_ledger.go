@@ -104,16 +104,16 @@ func defaultLocalFirstLedger() (*localFirstLedger, error) {
 		return nil, err
 	}
 
-	// SQLite connection string with pragmas to ensure they apply to all connections
-	// Using query parameters ensures each connection gets the same settings
-	connStr := path + "?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&cache=shared"
+	// SQLite connection string with pragmas using modernc.org/sqlite syntax
+	// Using _pragma parameters ensures each connection gets the same settings
+	connStr := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=cache_size(-64000)&cache=shared"
 	db, err := sql.Open("sqlite", connStr)
 	if err != nil {
 		return nil, err
 	}
-	// Keep conservative connection pool to avoid "database is locked" errors
-	// WAL mode helps, but too many concurrent writers can still cause issues
-	db.SetMaxOpenConns(2)
+	// Keep single connection to avoid "database is locked" errors
+	// SQLite with WAL mode is optimized for this use case
+	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
 	db.SetConnMaxIdleTime(10 * time.Minute)
@@ -158,10 +158,6 @@ type localFirstLedger struct {
 
 func (l *localFirstLedger) init(ctx context.Context) error {
 	stmts := []string{
-		`PRAGMA journal_mode=WAL`,
-		`PRAGMA synchronous=NORMAL`,
-		`PRAGMA busy_timeout=5000`, // 5 second lock timeout
-		`PRAGMA cache_size=-64000`, // 64MB cache
 		`CREATE TABLE IF NOT EXISTS local_usage_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			request_id TEXT NOT NULL,
@@ -239,7 +235,7 @@ func (l *localFirstLedger) addColumnIfMissing(ctx context.Context, table, name, 
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var cid int

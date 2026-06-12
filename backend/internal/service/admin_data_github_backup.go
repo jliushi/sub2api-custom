@@ -519,7 +519,7 @@ func collectAdminDataTable(ctx context.Context, tx *sql.Tx, tableName string) (*
 	if err != nil {
 		return nil, fmt.Errorf("query table %s: %w", tableName, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	table := &adminDataBackupTable{
 		Name:    tableName,
