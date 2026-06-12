@@ -548,7 +548,7 @@ func adminDataTableColumns(ctx context.Context, tx *sql.Tx, tableName string) ([
 	if err != nil {
 		return nil, fmt.Errorf("load columns for %s: %w", tableName, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var columns []string
 	for rows.Next() {

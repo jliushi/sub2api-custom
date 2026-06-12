@@ -15,7 +15,10 @@ import (
 	"github.com/dgraph-io/ristretto"
 )
 
-const apiKeyAuthSnapshotVersion = 12 // v12: exclusive group auth fields and local-first billing overlay
+const (
+	apiKeyAuthSnapshotVersion = 12 // v12: exclusive group auth fields and local-first billing overlay
+	apiKeyAuthDBQueryTimeout  = 500 * time.Millisecond
+)
 
 type apiKeyAuthCacheConfig struct {
 	l1Size        int
@@ -165,9 +168,8 @@ func (s *APIKeyService) deleteAuthCache(ctx context.Context, cacheKey string) {
 }
 
 func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey string) (*APIKeyAuthCacheEntry, error) {
-	// Add timeout for DB query to prevent long blocking
-	// Use 2s instead of 500ms to avoid false positives from cold connections and network jitter
-	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	// Keep the auth hot path bounded; repeated failures open the breaker quickly.
+	queryCtx, cancel := context.WithTimeout(ctx, apiKeyAuthDBQueryTimeout)
 	defer cancel()
 
 	// Use circuit breaker's AllowRequest instead of IsOpen to enable half-open testing
@@ -178,8 +180,7 @@ func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey st
 			var e error
 			apiKey, e = s.apiKeyRepo.GetByKeyForAuth(queryCtx, key)
 			dbErr = e
-			// Only record connection/timeout errors as circuit breaker failures
-			// Other errors (like auth errors) should not trigger the breaker
+			// NotFound is a valid auth result; transient DB failures trip the breaker.
 			if e != nil && !errors.Is(e, ErrAPIKeyNotFound) && isTimeoutOrConnectionError(e) {
 				return e
 			}
@@ -187,7 +188,7 @@ func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey st
 		})
 		// Circuit breaker rejected the request (open state)
 		if err == circuitbreaker.ErrCircuitOpen {
-			if stale := s.getStaleCacheEntry(cacheKey); stale != nil {
+			if stale := s.getStaleCacheEntry(ctx, cacheKey); stale != nil {
 				return stale, nil
 			}
 			return nil, fmt.Errorf("circuit breaker open and no stale cache available")
@@ -207,7 +208,7 @@ func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey st
 
 		// On timeout or connection error, try stale cache
 		if isTimeoutOrConnectionError(dbErr) {
-			if stale := s.getStaleCacheEntry(cacheKey); stale != nil {
+			if stale := s.getStaleCacheEntry(ctx, cacheKey); stale != nil {
 				return stale, nil
 			}
 		}

@@ -513,13 +513,7 @@ func (s *APIKeyService) GetByKey(ctx context.Context, key string) (*APIKey, erro
 		}
 	}
 
-	apiKey, err := s.apiKeyRepo.GetByKeyForAuth(ctx, key)
-	if err != nil {
-		return nil, fmt.Errorf("get api key: %w", err)
-	}
-	apiKey.Key = key
-	s.compileAPIKeyIPRules(apiKey)
-	return apiKey, nil
+	return nil, fmt.Errorf("get api key: invalid auth cache entry")
 }
 
 // Update 更新API Key

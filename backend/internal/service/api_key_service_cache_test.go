@@ -413,6 +413,76 @@ func TestAPIKeyService_GetByKey_CacheMissStoresL2(t *testing.T) {
 	require.Len(t, cache.setAuthKeys, 1)
 }
 
+func TestAPIKeyService_GetByKey_DBTimeoutWithInvalidStaleDoesNotRetryRawDB(t *testing.T) {
+	cache := &authCacheStub{}
+	var repoCalls int32
+	var sawDeadline atomic.Bool
+	repo := &authRepoStub{
+		getByKeyForAuth: func(ctx context.Context, key string) (*APIKey, error) {
+			atomic.AddInt32(&repoCalls, 1)
+			if _, ok := ctx.Deadline(); ok {
+				sawDeadline.Store(true)
+			}
+			return nil, context.DeadlineExceeded
+		},
+	}
+	cfg := &config.Config{
+		APIKeyAuth: config.APIKeyAuthCacheConfig{
+			L2TTLSeconds: 60,
+		},
+	}
+	svc := NewAPIKeyService(repo, nil, nil, nil, nil, cache, cfg)
+	cache.getAuthCache = func(ctx context.Context, key string) (*APIKeyAuthCacheEntry, error) {
+		return &APIKeyAuthCacheEntry{
+			Snapshot: &APIKeyAuthSnapshot{Version: apiKeyAuthSnapshotVersion - 1},
+		}, nil
+	}
+
+	_, err := svc.GetByKey(context.Background(), "k-timeout")
+	require.Error(t, err)
+	require.Equal(t, int32(1), atomic.LoadInt32(&repoCalls))
+	require.True(t, sawDeadline.Load())
+}
+
+func TestAPIKeyService_GetByKey_UsesShortDBTimeout(t *testing.T) {
+	var deadlineRemaining time.Duration
+	repo := &authRepoStub{
+		getByKeyForAuth: func(ctx context.Context, key string) (*APIKey, error) {
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok)
+			deadlineRemaining = time.Until(deadline)
+			return nil, ErrAPIKeyNotFound
+		},
+	}
+	svc := NewAPIKeyService(repo, nil, nil, nil, nil, nil, &config.Config{})
+
+	_, err := svc.GetByKey(context.Background(), "missing")
+	require.ErrorIs(t, err, ErrAPIKeyNotFound)
+	require.Positive(t, deadlineRemaining)
+	require.LessOrEqual(t, deadlineRemaining, apiKeyAuthDBQueryTimeout)
+}
+
+func TestAPIKeyService_GetStaleCacheEntryRespectsCanceledContext(t *testing.T) {
+	cache := &authCacheStub{}
+	var cacheCalls int32
+	cache.getAuthCache = func(ctx context.Context, key string) (*APIKeyAuthCacheEntry, error) {
+		atomic.AddInt32(&cacheCalls, 1)
+		return &APIKeyAuthCacheEntry{NotFound: true}, nil
+	}
+	cfg := &config.Config{
+		APIKeyAuth: config.APIKeyAuthCacheConfig{
+			L2TTLSeconds: 60,
+		},
+	}
+	svc := NewAPIKeyService(&authRepoStub{}, nil, nil, nil, nil, cache, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	stale := svc.getStaleCacheEntry(ctx, "cache-key")
+	require.Nil(t, stale)
+	require.Equal(t, int32(0), atomic.LoadInt32(&cacheCalls))
+}
+
 func TestAPIKeyService_GetByKey_UsesL1Cache(t *testing.T) {
 	var calls int32
 	cache := &authCacheStub{}

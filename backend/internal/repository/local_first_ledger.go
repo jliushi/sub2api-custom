@@ -407,7 +407,7 @@ func (l *localFirstLedger) PendingBillingDeltas(ctx context.Context, apiKeyID, u
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var deltas service.LocalBillingDeltas
 	for rows.Next() {
@@ -483,7 +483,7 @@ func (l *localFirstLedger) flushBilling(ctx context.Context) (localFirstFlushSta
 	if err != nil {
 		return localFirstFlushStats{}, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type event struct {
 		id           int64
@@ -577,7 +577,7 @@ func (l *localFirstLedger) flushUsage(ctx context.Context) (localFirstFlushStats
 	if err != nil {
 		return localFirstFlushStats{}, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type event struct {
 		id           int64

@@ -9,7 +9,7 @@
 1. **认证缓存失效时强依赖 DB 查询**，无降级策略
 2. **DB 查询无超时限制**，Supabase 10秒超时导致所有请求阻塞
 3. **singleflight 成为故障放大器**，一个请求失败导致所有等待的请求同时失败
-4. **SQLite 单连接瓶颈**，高并发时性能差
+4. **SQLite 本地账本写入需要有界锁等待与稳定 WAL 配置**，避免故障时阻塞请求路径
 
 ### 故障链路
 ```
@@ -83,14 +83,12 @@ apiKey, err := s.apiKeyRepo.GetByKeyForAuth(queryCtx, key)
 **文件：** `backend/internal/repository/local_first_ledger.go`
 
 **改动：**
-- 连接池：1 → 4 连接
-- 空闲连接：1 → 2
+- 保持单写连接，避免 SQLite 本地账本并发写入放大锁竞争
 - 添加 `busy_timeout=5000`（锁等待超时 5 秒）
 - 添加 `cache_size=-64000`（64MB 缓存）
 
 **效果：**
-- 更好的并发写入能力
-- WAL 模式下可以同时多读一写
+- WAL 模式下稳定支持读写并发，但写入仍保持串行
 - 减少锁竞争
 
 ## 测试验证
@@ -118,7 +116,7 @@ go test ./internal/pkg/circuitbreaker -v
 - 恢复需要手动重启服务
 
 **修复后：**
-- Supabase 故障 → 熔断器在 2.5 秒内打开（5次失败 × 500ms）
+- Supabase 故障 → 熔断器在约 2.5 秒内打开（5次失败 × 500ms）
 - 已缓存的 Key 继续正常工作（使用 stale cache）
 - 30 秒后自动测试恢复
 - 无需人工干预
@@ -178,11 +176,11 @@ go test ./internal/pkg/circuitbreaker -v
 
 ### 性能影响
 - ✅ 添加 500ms 超时，正常查询不受影响（通常 < 50ms）
-- ✅ SQLite 连接池增加，并发性能提升
+- ✅ SQLite 使用 WAL + busy_timeout + 单写连接，降低本地账本锁竞争风险
 - ⚠️ 熔断器增加少量 CPU 开销（可忽略）
 
 ### 数据一致性
-- ✅ 使用 stale cache 时，数据可能略微过期（最多几分钟）
+- ✅ 使用 stale cache 时，授权快照可能过期；窗口由 `api_key_auth_cache` 的 L1/L2 TTL 决定（默认 L2 300 秒，若生产配置 3600 秒则最多约 1 小时）
 - ✅ 计费数据有本地 ledger 兜底，不会丢失
 - ✅ 用户余额可能短时间内不准确，但不会造成超额扣费
 
