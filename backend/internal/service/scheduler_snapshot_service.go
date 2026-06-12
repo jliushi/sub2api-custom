@@ -11,6 +11,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -18,7 +19,13 @@ var (
 	ErrSchedulerFallbackLimited = errors.New("scheduler db fallback limited")
 )
 
-const outboxEventTimeout = 2 * time.Minute
+const (
+	outboxEventTimeout                    = 2 * time.Minute
+	schedulerNoAvailableRefreshCooldown   = 15 * time.Second
+	schedulerManualRefreshTimeout         = 2 * time.Minute
+	schedulerSingleBucketRefreshTimeout   = 35 * time.Second
+	schedulerAccountBucketRefreshReasonID = "account_refresh"
+)
 
 // batchSeenKey tracks which (groupID, platform) bucket sets have already been
 // rebuilt within a single pollOutbox call, to avoid redundant work when multiple
@@ -40,6 +47,9 @@ type SchedulerSnapshotService struct {
 	fallbackLimit *fallbackLimiter
 	lagMu         sync.Mutex
 	lagFailures   int
+	refreshMu     sync.Mutex
+	refreshLast   map[string]time.Time
+	refreshSF     singleflight.Group
 }
 
 func NewSchedulerSnapshotService(
@@ -61,6 +71,7 @@ func NewSchedulerSnapshotService(
 		cfg:           cfg,
 		stopCh:        make(chan struct{}),
 		fallbackLimit: newFallbackLimiter(maxQPS),
+		refreshLast:   make(map[string]time.Time),
 	}
 }
 
@@ -174,6 +185,134 @@ func (s *SchedulerSnapshotService) UpdateAccountInCache(ctx context.Context, acc
 		return nil
 	}
 	return s.cache.SetAccount(ctx, account)
+}
+
+// RefreshAccount updates the single-account cache and rebuilds the buckets that can
+// contain it. It replaces snapshots only after a DB load succeeds.
+func (s *SchedulerSnapshotService) RefreshAccount(ctx context.Context, account *Account, reason string) error {
+	if s == nil || account == nil {
+		return nil
+	}
+	if reason == "" {
+		reason = schedulerAccountBucketRefreshReasonID
+	}
+	if s.cache != nil {
+		if err := s.cache.SetAccount(ctx, account); err != nil {
+			return err
+		}
+	}
+	return s.rebuildByAccount(ctx, account, account.GroupIDs, reason, nil)
+}
+
+// RefreshAccountByID loads the latest account and refreshes the relevant scheduler
+// snapshots. It is intended for admin recovery paths where the DB write already
+// succeeded and cache freshness should be restored before returning.
+func (s *SchedulerSnapshotService) RefreshAccountByID(ctx context.Context, accountID int64, reason string) error {
+	if s == nil || accountID <= 0 || s.accountRepo == nil {
+		return nil
+	}
+	account, err := s.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		if errors.Is(err, ErrAccountNotFound) && s.cache != nil {
+			return s.cache.DeleteAccount(ctx, accountID)
+		}
+		return err
+	}
+	return s.RefreshAccount(ctx, account, reason)
+}
+
+// RefreshBucket rebuilds one scheduler bucket. It is safe to call from admin tools:
+// the active snapshot is kept until the replacement snapshot has been loaded.
+func (s *SchedulerSnapshotService) RefreshBucket(ctx context.Context, groupID *int64, platform string, hasForcePlatform bool, reason string) error {
+	if s == nil {
+		return ErrSchedulerCacheNotReady
+	}
+	if reason == "" {
+		reason = "manual"
+	}
+	bucket := s.bucketFor(groupID, platform, s.resolveMode(platform, hasForcePlatform))
+	return s.rebuildBucket(ctx, bucket, reason)
+}
+
+// RefreshAll rebuilds all known scheduler buckets.
+func (s *SchedulerSnapshotService) RefreshAll(ctx context.Context, reason string) error {
+	if s == nil {
+		return ErrSchedulerCacheNotReady
+	}
+	if s.cache == nil {
+		return ErrSchedulerCacheNotReady
+	}
+	if reason == "" {
+		reason = "manual_full"
+	}
+	ctx, cancel := context.WithTimeout(ctx, schedulerManualRefreshTimeout)
+	defer cancel()
+
+	buckets, err := s.cache.ListBuckets(ctx)
+	if err != nil {
+		return err
+	}
+	if len(buckets) == 0 {
+		buckets, err = s.defaultBuckets(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	return s.rebuildBuckets(ctx, buckets, reason)
+}
+
+// RefreshOpenAIBucketAfterNoAvailable is the guarded self-heal path for stale
+// OpenAI scheduler snapshots. It is singleflighted and cooldown-limited so a burst
+// of failing requests does not turn into a Supabase read storm.
+func (s *SchedulerSnapshotService) RefreshOpenAIBucketAfterNoAvailable(ctx context.Context, groupID *int64, reason string) (bool, error) {
+	if s == nil {
+		return false, ErrSchedulerCacheNotReady
+	}
+	if reason == "" {
+		reason = "openai_no_available"
+	}
+	bucket := s.bucketFor(groupID, PlatformOpenAI, SchedulerModeSingle)
+	key := "no_available:" + bucket.String()
+	if !s.allowCooldownRefresh(key, schedulerNoAvailableRefreshCooldown) {
+		return false, nil
+	}
+
+	_, err, _ := s.refreshSF.Do(key, func() (any, error) {
+		refreshCtx, cancel := context.WithTimeout(ctx, schedulerSingleBucketRefreshTimeout)
+		defer cancel()
+		return nil, s.rebuildBucket(refreshCtx, bucket, reason)
+	})
+	if err != nil {
+		s.clearCooldownRefresh(key)
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *SchedulerSnapshotService) allowCooldownRefresh(key string, cooldown time.Duration) bool {
+	if s == nil || cooldown <= 0 {
+		return true
+	}
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	if s.refreshLast == nil {
+		s.refreshLast = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if last, ok := s.refreshLast[key]; ok && now.Sub(last) < cooldown {
+		return false
+	}
+	s.refreshLast[key] = now
+	return true
+}
+
+func (s *SchedulerSnapshotService) clearCooldownRefresh(key string) {
+	if s == nil {
+		return
+	}
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	delete(s.refreshLast, key)
 }
 
 func (s *SchedulerSnapshotService) runInitialRebuild() {

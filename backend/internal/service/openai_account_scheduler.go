@@ -3,6 +3,7 @@ package service
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -1295,7 +1296,7 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 		}
 	}
 
-	return scheduler.Select(ctx, OpenAIAccountScheduleRequest{
+	req := OpenAIAccountScheduleRequest{
 		GroupID:                 groupID,
 		SessionHash:             sessionHash,
 		StickyAccountID:         stickyAccountID,
@@ -1306,7 +1307,28 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 		RequiredImageCapability: requiredImageCapability,
 		RequireCompact:          requireCompact,
 		ExcludedIDs:             excludedIDs,
-	})
+	}
+	selection, decision, err := scheduler.Select(ctx, req)
+	if err == nil || !errors.Is(err, ErrNoAvailableAccounts) || s.schedulerSnapshot == nil {
+		return selection, decision, err
+	}
+
+	refreshed, refreshErr := s.schedulerSnapshot.RefreshOpenAIBucketAfterNoAvailable(ctx, groupID, "openai_no_available")
+	if refreshErr != nil {
+		slog.Warn("openai scheduler snapshot self-heal failed",
+			"group_id", derefGroupID(groupID),
+			"model", requestedModel,
+			"err", refreshErr)
+		return selection, decision, err
+	}
+	if !refreshed {
+		return selection, decision, err
+	}
+
+	slog.Warn("openai scheduler snapshot self-heal retry",
+		"group_id", derefGroupID(groupID),
+		"model", requestedModel)
+	return scheduler.Select(ctx, req)
 }
 
 func accountSupportsOpenAICapabilities(account *Account, requiredCapability OpenAIEndpointCapability, requiredImageCapability OpenAIImagesCapability) bool {

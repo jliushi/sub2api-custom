@@ -14,7 +14,7 @@ type settingRepository struct {
 }
 
 func NewSettingRepository(client *ent.Client) service.SettingRepository {
-	return &settingRepository{client: client}
+	return NewCachedSettingRepository(&settingRepository{client: client})
 }
 
 func (r *settingRepository) Get(ctx context.Context, key string) (*service.Setting, error) {

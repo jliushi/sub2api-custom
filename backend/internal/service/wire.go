@@ -541,6 +541,7 @@ var ProviderSet = wire.NewSet(
 	ProvideSettingService,
 	NewDataManagementService,
 	ProvideBackupService,
+	ProvideAdminDataGitHubBackupService,
 	ProvideOpsSystemLogSink,
 	ProvideOpsService,
 	ProvideOpsMetricsCollector,

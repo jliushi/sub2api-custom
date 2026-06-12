@@ -17,6 +17,7 @@ type openAISnapshotCacheStub struct {
 	SchedulerCache
 	snapshotAccounts []*Account
 	accountsByID     map[int64]*Account
+	snapshotHit      bool
 }
 
 type schedulerTestOpenAIAccountRepo struct {
@@ -240,7 +241,7 @@ func newOpenAIAdvancedSchedulerRateLimitService(enabled string) *RateLimitServic
 }
 
 func (s *openAISnapshotCacheStub) GetSnapshot(ctx context.Context, bucket SchedulerBucket) ([]*Account, bool, error) {
-	if len(s.snapshotAccounts) == 0 {
+	if !s.snapshotHit && len(s.snapshotAccounts) == 0 {
 		return nil, false, nil
 	}
 	out := make([]*Account, 0, len(s.snapshotAccounts))
@@ -254,6 +255,21 @@ func (s *openAISnapshotCacheStub) GetSnapshot(ctx context.Context, bucket Schedu
 	return out, true, nil
 }
 
+func (s *openAISnapshotCacheStub) SetSnapshot(ctx context.Context, bucket SchedulerBucket, accounts []Account) error {
+	s.snapshotHit = true
+	s.snapshotAccounts = make([]*Account, 0, len(accounts))
+	if s.accountsByID == nil {
+		s.accountsByID = make(map[int64]*Account, len(accounts))
+	}
+	for i := range accounts {
+		cloned := accounts[i]
+		s.snapshotAccounts = append(s.snapshotAccounts, &cloned)
+		accountClone := accounts[i]
+		s.accountsByID[accountClone.ID] = &accountClone
+	}
+	return nil
+}
+
 func (s *openAISnapshotCacheStub) GetAccount(ctx context.Context, accountID int64) (*Account, error) {
 	if s.accountsByID == nil {
 		return nil, nil
@@ -264,6 +280,31 @@ func (s *openAISnapshotCacheStub) GetAccount(ctx context.Context, accountID int6
 	}
 	cloned := *account
 	return &cloned, nil
+}
+
+func (s *openAISnapshotCacheStub) SetAccount(ctx context.Context, account *Account) error {
+	if account == nil {
+		return nil
+	}
+	if s.accountsByID == nil {
+		s.accountsByID = make(map[int64]*Account)
+	}
+	cloned := *account
+	s.accountsByID[account.ID] = &cloned
+	return nil
+}
+
+func (s *openAISnapshotCacheStub) DeleteAccount(ctx context.Context, accountID int64) error {
+	delete(s.accountsByID, accountID)
+	return nil
+}
+
+func (s *openAISnapshotCacheStub) TryLockBucket(ctx context.Context, bucket SchedulerBucket, ttl time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (s *openAISnapshotCacheStub) UnlockBucket(ctx context.Context, bucket SchedulerBucket) error {
+	return nil
 }
 
 func TestOpenAIGatewayService_SelectAccountWithScheduler_DefaultDisabledUsesLegacyLoadAwareness(t *testing.T) {
@@ -713,6 +754,44 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_SessionStickyRateLimite
 	require.NotNil(t, selection.Account)
 	require.Equal(t, int64(31002), selection.Account.ID)
 	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_NoAvailableRefreshesStaleSnapshotAndRetries(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(10177)
+	fresh := Account{
+		ID:          31177,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Priority:    1,
+	}
+	accountRepo := schedulerTestOpenAIAccountRepo{accounts: []Account{fresh}}
+	snapshotCache := &openAISnapshotCacheStub{
+		snapshotHit:      true,
+		snapshotAccounts: []*Account{},
+		accountsByID:     map[int64]*Account{},
+	}
+	snapshotService := NewSchedulerSnapshotService(snapshotCache, nil, accountRepo, nil, &config.Config{})
+	svc := &OpenAIGatewayService{
+		accountRepo:        accountRepo,
+		cache:              &schedulerTestGatewayCache{},
+		cfg:                &config.Config{},
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
+		schedulerSnapshot:  snapshotService,
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{}),
+		openaiAccountStats: newOpenAIAccountRuntimeStats(),
+	}
+
+	selection, decision, err := svc.SelectAccountWithScheduler(ctx, &groupID, "", "session_hash_stale_snapshot", "gpt-5.1", nil, OpenAIUpstreamTransportAny, false)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(31177), selection.Account.ID)
+	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+	require.Len(t, snapshotCache.snapshotAccounts, 1)
 }
 
 func TestOpenAIGatewayService_SelectAccountForModelWithExclusions_AutoPauseBy5hThreshold(t *testing.T) {

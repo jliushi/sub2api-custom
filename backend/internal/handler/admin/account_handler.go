@@ -58,6 +58,7 @@ type AccountHandler struct {
 	sessionLimitCache       service.SessionLimitCache
 	rpmCache                service.RPMCache
 	tokenCacheInvalidator   service.TokenCacheInvalidator
+	schedulerSnapshot       *service.SchedulerSnapshotService
 }
 
 // NewAccountHandler creates a new admin account handler
@@ -75,7 +76,12 @@ func NewAccountHandler(
 	sessionLimitCache service.SessionLimitCache,
 	rpmCache service.RPMCache,
 	tokenCacheInvalidator service.TokenCacheInvalidator,
+	schedulerSnapshots ...*service.SchedulerSnapshotService,
 ) *AccountHandler {
+	var schedulerSnapshot *service.SchedulerSnapshotService
+	if len(schedulerSnapshots) > 0 {
+		schedulerSnapshot = schedulerSnapshots[0]
+	}
 	return &AccountHandler{
 		adminService:            adminService,
 		oauthService:            oauthService,
@@ -90,7 +96,101 @@ func NewAccountHandler(
 		sessionLimitCache:       sessionLimitCache,
 		rpmCache:                rpmCache,
 		tokenCacheInvalidator:   tokenCacheInvalidator,
+		schedulerSnapshot:       schedulerSnapshot,
 	}
+}
+
+func (h *AccountHandler) refreshSchedulerSnapshotForAccount(ctx context.Context, account *service.Account, accountID int64, reason string) {
+	if h == nil || h.schedulerSnapshot == nil {
+		return
+	}
+	var err error
+	if account != nil {
+		err = h.schedulerSnapshot.RefreshAccount(ctx, account, reason)
+	} else {
+		err = h.schedulerSnapshot.RefreshAccountByID(ctx, accountID, reason)
+	}
+	if err != nil {
+		slog.Warn("scheduler snapshot refresh after admin account change failed",
+			"account_id", accountID,
+			"reason", reason,
+			"err", err)
+	}
+}
+
+// RefreshSchedulerSnapshot rebuilds scheduler snapshots without changing account data.
+// POST /api/v1/admin/scheduler/snapshot/refresh
+func (h *AccountHandler) RefreshSchedulerSnapshot(c *gin.Context) {
+	if h.schedulerSnapshot == nil {
+		response.Error(c, http.StatusServiceUnavailable, "Scheduler snapshot service unavailable")
+		return
+	}
+
+	var req struct {
+		AccountID     int64  `json:"account_id"`
+		GroupID       *int64 `json:"group_id"`
+		Platform      string `json:"platform"`
+		ForcePlatform bool   `json:"force_platform"`
+		All           bool   `json:"all"`
+		Reason        string `json:"reason"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	if req.Reason == "" {
+		req.Reason = "admin_manual"
+	}
+
+	start := time.Now()
+	if req.All {
+		if err := h.schedulerSnapshot.RefreshAll(c.Request.Context(), req.Reason); err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+		response.Success(c, gin.H{"refreshed": true, "scope": "all", "duration_ms": time.Since(start).Milliseconds()})
+		return
+	}
+	if req.AccountID > 0 {
+		if err := h.schedulerSnapshot.RefreshAccountByID(c.Request.Context(), req.AccountID, req.Reason); err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+		response.Success(c, gin.H{"refreshed": true, "scope": "account", "account_id": req.AccountID, "duration_ms": time.Since(start).Milliseconds()})
+		return
+	}
+
+	platform := strings.TrimSpace(req.Platform)
+	if platform == "" {
+		platform = service.PlatformOpenAI
+	}
+	if err := h.schedulerSnapshot.RefreshBucket(c.Request.Context(), req.GroupID, platform, req.ForcePlatform, req.Reason); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, gin.H{
+		"refreshed":      true,
+		"scope":          "bucket",
+		"group_id":       req.GroupID,
+		"platform":       platform,
+		"force_platform": req.ForcePlatform,
+		"duration_ms":    time.Since(start).Milliseconds(),
+	})
+}
+
+// FlushLocalBilling flushes local-first billing/usage events into the primary DB.
+// POST /api/v1/admin/billing/local-first/flush
+func (h *AccountHandler) FlushLocalBilling(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Minute)
+	defer cancel()
+	start := time.Now()
+
+	result, err := service.FlushLocalBilling(ctx)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, gin.H{
+		"flushed":     result.Flushed,
+		"duration_ms": time.Since(start).Milliseconds(),
+	})
 }
 
 // CreateAccountRequest represents create account request
@@ -770,6 +870,7 @@ func (h *AccountHandler) RecoverState(c *gin.Context) {
 		return
 	}
 
+	h.refreshSchedulerSnapshotForAccount(c.Request.Context(), account, accountID, "admin_recover_state")
 	response.Success(c, h.buildAccountResponseWithRuntime(c.Request.Context(), account))
 }
 
@@ -1129,6 +1230,7 @@ func (h *AccountHandler) ClearError(c *gin.Context) {
 		}
 	}
 
+	h.refreshSchedulerSnapshotForAccount(c.Request.Context(), account, accountID, "admin_clear_error")
 	response.Success(c, h.buildAccountResponseWithRuntime(c.Request.Context(), account))
 }
 
@@ -1194,6 +1296,7 @@ func (h *AccountHandler) BatchClearError(c *gin.Context) {
 					log.Printf("[WARN] Failed to invalidate token cache for account %d: %v", accountID, invalidateErr)
 				}
 			}
+			h.refreshSchedulerSnapshotForAccount(gctx, account, accountID, "admin_batch_clear_error")
 
 			mu.Lock()
 			successCount++
@@ -1798,6 +1901,7 @@ func (h *AccountHandler) ClearRateLimit(c *gin.Context) {
 		return
 	}
 
+	h.refreshSchedulerSnapshotForAccount(c.Request.Context(), account, accountID, "admin_clear_rate_limit")
 	response.Success(c, h.buildAccountResponseWithRuntime(c.Request.Context(), account))
 }
 
@@ -1864,6 +1968,7 @@ func (h *AccountHandler) ClearTempUnschedulable(c *gin.Context) {
 		return
 	}
 
+	h.refreshSchedulerSnapshotForAccount(c.Request.Context(), nil, accountID, "admin_clear_temp_unschedulable")
 	response.Success(c, gin.H{"message": "Temp unschedulable cleared successfully"})
 }
 
@@ -1962,6 +2067,7 @@ func (h *AccountHandler) SetSchedulable(c *gin.Context) {
 		return
 	}
 
+	h.refreshSchedulerSnapshotForAccount(c.Request.Context(), account, accountID, "admin_set_schedulable")
 	response.Success(c, h.buildAccountResponseWithRuntime(c.Request.Context(), account))
 }
 

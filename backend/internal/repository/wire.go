@@ -47,6 +47,14 @@ func ProvideSessionLimitCache(rdb *redis.Client, cfg *config.Config) service.Ses
 	return NewSessionLimitCache(rdb, defaultIdleTimeoutMinutes)
 }
 
+func ProvideUsageLogRepository(client *ent.Client, db *sql.DB) service.UsageLogRepository {
+	return NewLocalFirstUsageLogRepository(NewUsageLogRepository(client, db))
+}
+
+func ProvideUsageBillingRepository(client *ent.Client, db *sql.DB) service.UsageBillingRepository {
+	return NewLocalFirstUsageBillingRepository(NewUsageBillingRepository(client, db))
+}
+
 // ProvideSchedulerCache 创建调度快照缓存，并注入快照分块参数。
 func ProvideSchedulerCache(rdb *redis.Client, cfg *config.Config) service.SchedulerCache {
 	mgetChunkSize := defaultSchedulerSnapshotMGetChunkSize
@@ -75,8 +83,8 @@ var ProviderSet = wire.NewSet(
 	NewPromoCodeRepository,
 	NewAnnouncementRepository,
 	NewAnnouncementReadRepository,
-	NewUsageLogRepository,
-	NewUsageBillingRepository,
+	ProvideUsageLogRepository,
+	ProvideUsageBillingRepository,
 	NewIdempotencyRepository,
 	NewUsageCleanupRepository,
 	NewDashboardAggregationRepository,

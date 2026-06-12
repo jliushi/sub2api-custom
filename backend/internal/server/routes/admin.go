@@ -35,6 +35,12 @@ func RegisterAdminRoutes(
 		// 账号管理
 		registerAccountRoutes(admin, h)
 
+		// 调度快照维护
+		registerSchedulerRoutes(admin, h)
+
+		// 本地账本维护
+		registerBillingRoutes(admin, h)
+
 		// 公告管理
 		registerAnnouncementRoutes(admin, h)
 
@@ -339,6 +345,20 @@ func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		accounts.POST("/exchange-setup-token-code", h.Admin.OAuth.ExchangeSetupTokenCode)
 		accounts.POST("/cookie-auth", h.Admin.OAuth.CookieAuth)
 		accounts.POST("/setup-token-cookie-auth", h.Admin.OAuth.SetupTokenCookieAuth)
+	}
+}
+
+func registerSchedulerRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	scheduler := admin.Group("/scheduler")
+	{
+		scheduler.POST("/snapshot/refresh", h.Admin.Account.RefreshSchedulerSnapshot)
+	}
+}
+
+func registerBillingRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	billing := admin.Group("/billing")
+	{
+		billing.POST("/local-first/flush", h.Admin.Account.FlushLocalBilling)
 	}
 }
 

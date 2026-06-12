@@ -97,6 +97,7 @@ func provideCleanup(
 	openAIGateway *service.OpenAIGatewayService,
 	scheduledTestRunner *service.ScheduledTestRunnerService,
 	backupSvc *service.BackupService,
+	adminDataBackupSvc *service.AdminDataGitHubBackupService,
 	paymentOrderExpiry *service.PaymentOrderExpiryService,
 	channelMonitorRunner *service.ChannelMonitorRunner,
 	quotaFlusher *service.UserPlatformQuotaUsageFlusher,
@@ -196,6 +197,12 @@ func provideCleanup(
 				emailQueue.Stop()
 				return nil
 			}},
+			{"LocalBillingLedger", func() error {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				_, err := service.FlushLocalBilling(ctx)
+				return err
+			}},
 			{"BillingCacheService", func() error {
 				billingCache.Stop()
 				return nil
@@ -237,6 +244,12 @@ func provideCleanup(
 			{"BackupService", func() error {
 				if backupSvc != nil {
 					backupSvc.Stop()
+				}
+				return nil
+			}},
+			{"AdminDataGitHubBackupService", func() error {
+				if adminDataBackupSvc != nil {
+					adminDataBackupSvc.Stop()
 				}
 				return nil
 			}},

@@ -8349,6 +8349,18 @@ type apiKeyAuthCacheInvalidator interface {
 	InvalidateAuthCacheByKey(ctx context.Context, key string)
 }
 
+type apiKeyAuthCacheBillingAdjuster interface {
+	AdjustAuthCacheAfterBilling(ctx context.Context, apiKey *APIKey, balanceCost, quotaCost float64)
+}
+
+type apiKeyAuthCacheBillingLocker interface {
+	LockAuthCacheBilling(apiKey *APIKey) func()
+}
+
+type apiKeyAuthCacheBillingLockedAdjuster interface {
+	adjustAuthCacheAfterBillingLocked(ctx context.Context, apiKey *APIKey, balanceCost, quotaCost float64)
+}
+
 type usageLogBestEffortWriter interface {
 	CreateBestEffort(ctx context.Context, log *UsageLog) error
 }
@@ -8574,6 +8586,18 @@ func applyUsageBilling(ctx context.Context, requestID string, usageLog *UsageLog
 	billingCtx, cancel := detachedBillingContext(ctx)
 	defer cancel()
 
+	unlockBillingCache := func() {}
+	lockedBillingCache := false
+	if locker, ok := p.APIKeyService.(apiKeyAuthCacheBillingLocker); ok && p.APIKey != nil {
+		unlockBillingCache = locker.LockAuthCacheBilling(p.APIKey)
+		lockedBillingCache = true
+	}
+	defer func() {
+		if lockedBillingCache {
+			unlockBillingCache()
+		}
+	}()
+
 	result, err := repo.Apply(billingCtx, cmd)
 	if err != nil {
 		return false, err
@@ -8590,11 +8614,18 @@ func applyUsageBilling(ctx context.Context, requestID string, usageLog *UsageLog
 		}
 	}
 
-	finalizePostUsageBilling(billingCtx, p, deps, result)
+	finalizePostUsageBillingWithOptions(billingCtx, p, deps, result, !lockedBillingCache)
+	if lockedBillingCache {
+		adjustAuthCacheAfterBillingLocked(billingCtx, p)
+	}
 	return true, nil
 }
 
 func finalizePostUsageBilling(ctx context.Context, p *postUsageBillingParams, deps *billingDeps, result *UsageBillingApplyResult) {
+	finalizePostUsageBillingWithOptions(ctx, p, deps, result, true)
+}
+
+func finalizePostUsageBillingWithOptions(ctx context.Context, p *postUsageBillingParams, deps *billingDeps, result *UsageBillingApplyResult, adjustAuthCache bool) {
 	if p == nil || p.Cost == nil || deps == nil {
 		return
 	}
@@ -8609,6 +8640,10 @@ func finalizePostUsageBilling(ctx context.Context, p *postUsageBillingParams, de
 
 	if p.Cost.ActualCost > 0 && p.APIKey != nil && p.APIKey.HasRateLimits() {
 		deps.billingCacheService.QueueUpdateAPIKeyRateLimitUsage(p.APIKey.ID, p.Cost.ActualCost)
+	}
+
+	if adjustAuthCache {
+		adjustAuthCacheAfterBilling(ctx, p)
 	}
 
 	deps.deferredService.ScheduleLastUsedUpdate(p.Account.ID)
@@ -8651,6 +8686,45 @@ func finalizePostUsageBilling(ctx context.Context, p *postUsageBillingParams, de
 	// no dependency on the request context or upstream connection.
 	go notifyBalanceLow(p, deps, result)
 	go notifyAccountQuota(p, deps, result)
+}
+
+func adjustAuthCacheAfterBilling(ctx context.Context, p *postUsageBillingParams) {
+	if p == nil || p.Cost == nil || p.APIKey == nil {
+		return
+	}
+	adjuster, ok := p.APIKeyService.(apiKeyAuthCacheBillingAdjuster)
+	if !ok {
+		return
+	}
+	balanceCost, quotaCost := postUsageAuthCacheBillingCosts(p)
+	adjuster.AdjustAuthCacheAfterBilling(ctx, p.APIKey, balanceCost, quotaCost)
+}
+
+func adjustAuthCacheAfterBillingLocked(ctx context.Context, p *postUsageBillingParams) {
+	if p == nil || p.Cost == nil || p.APIKey == nil {
+		return
+	}
+	adjuster, ok := p.APIKeyService.(apiKeyAuthCacheBillingLockedAdjuster)
+	if !ok {
+		return
+	}
+	balanceCost, quotaCost := postUsageAuthCacheBillingCosts(p)
+	adjuster.adjustAuthCacheAfterBillingLocked(ctx, p.APIKey, balanceCost, quotaCost)
+}
+
+func postUsageAuthCacheBillingCosts(p *postUsageBillingParams) (float64, float64) {
+	if p == nil || p.Cost == nil {
+		return 0, 0
+	}
+	var balanceCost float64
+	if !p.IsSubscriptionBill {
+		balanceCost = p.Cost.ActualCost
+	}
+	var quotaCost float64
+	if p.Cost.ActualCost > 0 && p.APIKey != nil && p.APIKey.Quota > 0 {
+		quotaCost = p.Cost.ActualCost
+	}
+	return balanceCost, quotaCost
 }
 
 // notifyBalanceLow sends balance low notification after deduction.

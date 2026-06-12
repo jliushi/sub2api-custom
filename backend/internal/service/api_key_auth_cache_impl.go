@@ -14,7 +14,7 @@ import (
 	"github.com/dgraph-io/ristretto"
 )
 
-const apiKeyAuthSnapshotVersion = 12 // v12: include exclusive group authorization fields
+const apiKeyAuthSnapshotVersion = 12 // v12: exclusive group auth fields and local-first billing overlay
 
 type apiKeyAuthCacheConfig struct {
 	l1Size        int
@@ -181,6 +181,10 @@ func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey st
 		return nil, fmt.Errorf("get api key: %w", ErrAPIKeyNotFound)
 	}
 	entry := &APIKeyAuthCacheEntry{Snapshot: snapshot}
+	lock := s.authCacheAdjustLock(cacheKey)
+	lock.Lock()
+	defer lock.Unlock()
+	s.applyLocalBillingOverlay(ctx, snapshot)
 	s.setAuthCacheEntry(ctx, cacheKey, entry, s.authCfg.l2TTL)
 	return entry, nil
 }

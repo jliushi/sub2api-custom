@@ -1311,9 +1311,9 @@ func noAvailableOpenAISelectionError(requestedModel string, compactBlocked bool)
 		return ErrNoAvailableCompactAccounts
 	}
 	if requestedModel != "" {
-		return fmt.Errorf("no available OpenAI accounts supporting model: %s", requestedModel)
+		return fmt.Errorf("%w: no available OpenAI accounts supporting model: %s", ErrNoAvailableAccounts, requestedModel)
 	}
-	return errors.New("no available OpenAI accounts")
+	return fmt.Errorf("%w: no available OpenAI accounts", ErrNoAvailableAccounts)
 }
 
 // openAICompactSupportTier classifies an OpenAI account by compact capability.
