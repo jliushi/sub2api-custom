@@ -17,7 +17,12 @@ import (
 
 const (
 	apiKeyAuthSnapshotVersion = 12 // v12: exclusive group auth fields and local-first billing overlay
-	apiKeyAuthDBQueryTimeout  = 500 * time.Millisecond
+	// 以下为认证 DB 超时/熔断的默认值,可被 config(APIKeyAuthCacheConfig)覆盖。
+	apiKeyAuthDBQueryTimeout      = 500 * time.Millisecond
+	defaultAuthCBFailureThreshold = 5
+	defaultAuthCBSuccessThreshold = 2
+	defaultAuthCBTimeout          = 30 * time.Second
+	defaultAuthCBHalfOpenMaxCalls = 3
 )
 
 type apiKeyAuthCacheConfig struct {
@@ -27,21 +32,49 @@ type apiKeyAuthCacheConfig struct {
 	negativeTTL   time.Duration
 	jitterPercent int
 	singleflight  bool
+
+	dbQueryTimeout     time.Duration
+	cbFailureThreshold int
+	cbSuccessThreshold int
+	cbTimeout          time.Duration
+	cbHalfOpenMaxCalls int
 }
 
 func newAPIKeyAuthCacheConfig(cfg *config.Config) apiKeyAuthCacheConfig {
+	// 默认值与历史硬编码保持一致;config 留空(<=0)则行为不变。
+	c := apiKeyAuthCacheConfig{
+		dbQueryTimeout:     apiKeyAuthDBQueryTimeout,
+		cbFailureThreshold: defaultAuthCBFailureThreshold,
+		cbSuccessThreshold: defaultAuthCBSuccessThreshold,
+		cbTimeout:          defaultAuthCBTimeout,
+		cbHalfOpenMaxCalls: defaultAuthCBHalfOpenMaxCalls,
+	}
 	if cfg == nil {
-		return apiKeyAuthCacheConfig{}
+		return c
 	}
 	auth := cfg.APIKeyAuth
-	return apiKeyAuthCacheConfig{
-		l1Size:        auth.L1Size,
-		l1TTL:         time.Duration(auth.L1TTLSeconds) * time.Second,
-		l2TTL:         time.Duration(auth.L2TTLSeconds) * time.Second,
-		negativeTTL:   time.Duration(auth.NegativeTTLSeconds) * time.Second,
-		jitterPercent: auth.JitterPercent,
-		singleflight:  auth.Singleflight,
+	c.l1Size = auth.L1Size
+	c.l1TTL = time.Duration(auth.L1TTLSeconds) * time.Second
+	c.l2TTL = time.Duration(auth.L2TTLSeconds) * time.Second
+	c.negativeTTL = time.Duration(auth.NegativeTTLSeconds) * time.Second
+	c.jitterPercent = auth.JitterPercent
+	c.singleflight = auth.Singleflight
+	if auth.DBQueryTimeoutMs > 0 {
+		c.dbQueryTimeout = time.Duration(auth.DBQueryTimeoutMs) * time.Millisecond
 	}
+	if auth.CBFailureThreshold > 0 {
+		c.cbFailureThreshold = auth.CBFailureThreshold
+	}
+	if auth.CBSuccessThreshold > 0 {
+		c.cbSuccessThreshold = auth.CBSuccessThreshold
+	}
+	if auth.CBTimeoutSeconds > 0 {
+		c.cbTimeout = time.Duration(auth.CBTimeoutSeconds) * time.Second
+	}
+	if auth.CBHalfOpenMaxCalls > 0 {
+		c.cbHalfOpenMaxCalls = auth.CBHalfOpenMaxCalls
+	}
+	return c
 }
 
 func (c apiKeyAuthCacheConfig) l1Enabled() bool {
@@ -169,7 +202,11 @@ func (s *APIKeyService) deleteAuthCache(ctx context.Context, cacheKey string) {
 
 func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey string) (*APIKeyAuthCacheEntry, error) {
 	// Keep the auth hot path bounded; repeated failures open the breaker quickly.
-	queryCtx, cancel := context.WithTimeout(ctx, apiKeyAuthDBQueryTimeout)
+	dbTimeout := s.authCfg.dbQueryTimeout
+	if dbTimeout <= 0 {
+		dbTimeout = apiKeyAuthDBQueryTimeout
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, dbTimeout)
 	defer cancel()
 
 	// Use circuit breaker's AllowRequest instead of IsOpen to enable half-open testing

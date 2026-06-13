@@ -232,14 +232,15 @@ func NewAPIKeyService(
 		userGroupRateRepo: userGroupRateRepo,
 		cache:             cache,
 		cfg:               cfg,
-		dbCircuitBreaker: circuitbreaker.New(circuitbreaker.Config{
-			FailureThreshold: 5,
-			SuccessThreshold: 2,
-			Timeout:          30 * time.Second,
-			HalfOpenMaxCalls: 3,
-		}),
 	}
 	svc.initAuthCache(cfg)
+	// 熔断器参数来自 authCfg(已含默认值);circuitbreaker.New 内部对 <=0 仍会兜底。
+	svc.dbCircuitBreaker = circuitbreaker.New(circuitbreaker.Config{
+		FailureThreshold: svc.authCfg.cbFailureThreshold,
+		SuccessThreshold: svc.authCfg.cbSuccessThreshold,
+		Timeout:          svc.authCfg.cbTimeout,
+		HalfOpenMaxCalls: svc.authCfg.cbHalfOpenMaxCalls,
+	})
 	return svc
 }
 

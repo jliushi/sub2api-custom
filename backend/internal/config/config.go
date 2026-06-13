@@ -1269,6 +1269,13 @@ type APIKeyAuthCacheConfig struct {
 	NegativeTTLSeconds int  `mapstructure:"negative_ttl_seconds"`
 	JitterPercent      int  `mapstructure:"jitter_percent"`
 	Singleflight       bool `mapstructure:"singleflight"`
+	// DBQueryTimeoutMs 认证查询主库的超时(毫秒);<=0 用默认 500ms。
+	DBQueryTimeoutMs int `mapstructure:"db_query_timeout_ms"`
+	// 熔断器参数:保护 auth 热路径,避免主库抖动级联失败;各项 <=0 用默认值(5/2/30s/3)。
+	CBFailureThreshold int `mapstructure:"cb_failure_threshold"`
+	CBSuccessThreshold int `mapstructure:"cb_success_threshold"`
+	CBTimeoutSeconds   int `mapstructure:"cb_timeout_seconds"`
+	CBHalfOpenMaxCalls int `mapstructure:"cb_half_open_max_calls"`
 }
 
 // SubscriptionCacheConfig 订阅认证 L1 缓存配置

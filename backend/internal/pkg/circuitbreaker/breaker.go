@@ -6,10 +6,7 @@ import (
 	"time"
 )
 
-var (
-	ErrCircuitOpen     = errors.New("circuit breaker is open")
-	ErrCircuitHalfOpen = errors.New("circuit breaker is half-open, request rejected")
-)
+var ErrCircuitOpen = errors.New("circuit breaker is open")
 
 // State represents the circuit breaker state
 type State int
