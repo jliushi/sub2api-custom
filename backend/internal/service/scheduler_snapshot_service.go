@@ -278,7 +278,10 @@ func (s *SchedulerSnapshotService) RefreshOpenAIBucketAfterNoAvailable(ctx conte
 	}
 
 	_, err, _ := s.refreshSF.Do(key, func() (any, error) {
-		refreshCtx, cancel := context.WithTimeout(ctx, schedulerSingleBucketRefreshTimeout)
+		// 重建脱离触发它的请求 ctx：failover 风暴或客户端断开导致请求 ctx 取消时，
+		// 不应中断 bucket 重建，否则被污染/过期的快照会一直坏到人工干预（如切换调度开关）。
+		// 仅保留独立超时约束。
+		refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), schedulerSingleBucketRefreshTimeout)
 		defer cancel()
 		return nil, s.rebuildBucket(refreshCtx, bucket, reason)
 	})

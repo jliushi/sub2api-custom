@@ -1230,56 +1230,8 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 	scheduler := s.getOpenAIAccountScheduler(ctx)
 	if scheduler == nil {
 		decision.Layer = openAIAccountScheduleLayerLoadBalance
-		if requiredTransport == OpenAIUpstreamTransportAny || requiredTransport == OpenAIUpstreamTransportHTTPSSE {
-			effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
-			for {
-				selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, sessionHash, requestedModel, effectiveExcludedIDs, requireCompact, requiredCapability)
-				if err != nil {
-					return nil, decision, err
-				}
-				if selection == nil || selection.Account == nil {
-					return selection, decision, nil
-				}
-				if accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) {
-					return selection, decision, nil
-				}
-				if selection.ReleaseFunc != nil {
-					selection.ReleaseFunc()
-				}
-				if effectiveExcludedIDs == nil {
-					effectiveExcludedIDs = make(map[int64]struct{})
-				}
-				if _, exists := effectiveExcludedIDs[selection.Account.ID]; exists {
-					return nil, decision, ErrNoAvailableAccounts
-				}
-				effectiveExcludedIDs[selection.Account.ID] = struct{}{}
-			}
-		}
-
-		effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
-		for {
-			selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, sessionHash, requestedModel, effectiveExcludedIDs, requireCompact, requiredCapability)
-			if err != nil {
-				return nil, decision, err
-			}
-			if selection == nil || selection.Account == nil {
-				return selection, decision, nil
-			}
-			if s.isOpenAIAccountTransportCompatible(selection.Account, requiredTransport) &&
-				accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) {
-				return selection, decision, nil
-			}
-			if selection.ReleaseFunc != nil {
-				selection.ReleaseFunc()
-			}
-			if effectiveExcludedIDs == nil {
-				effectiveExcludedIDs = make(map[int64]struct{})
-			}
-			if _, exists := effectiveExcludedIDs[selection.Account.ID]; exists {
-				return nil, decision, ErrNoAvailableAccounts
-			}
-			effectiveExcludedIDs[selection.Account.ID] = struct{}{}
-		}
+		selection, err := s.selectViaLoadAwareLoop(ctx, groupID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact)
+		return selection, decision, err
 	}
 
 	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
@@ -1309,26 +1261,125 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 		ExcludedIDs:             excludedIDs,
 	}
 	selection, decision, err := scheduler.Select(ctx, req)
-	if err == nil || !errors.Is(err, ErrNoAvailableAccounts) || s.schedulerSnapshot == nil {
+	if err == nil {
+		return selection, decision, nil
+	}
+
+	// 父请求 ctx 已取消：客户端已离开，直连 DB 回退也会立刻再次失败，原样返回。
+	if ctx.Err() != nil {
 		return selection, decision, err
 	}
 
-	refreshed, refreshErr := s.schedulerSnapshot.RefreshOpenAIBucketAfterNoAvailable(ctx, groupID, "openai_no_available")
-	if refreshErr != nil {
-		slog.Warn("openai scheduler snapshot self-heal failed",
-			"group_id", derefGroupID(groupID),
-			"model", requestedModel,
-			"err", refreshErr)
-		return selection, decision, err
-	}
-	if !refreshed {
-		return selection, decision, err
+	// ErrNoAvailableAccounts：先尝试快照自愈 + 重试（重建已脱离请求 ctx，
+	// 见 RefreshOpenAIBucketAfterNoAvailable）。重试仍失败则落入下方直连 DB 回退。
+	if errors.Is(err, ErrNoAvailableAccounts) && s.schedulerSnapshot != nil {
+		refreshed, refreshErr := s.schedulerSnapshot.RefreshOpenAIBucketAfterNoAvailable(ctx, groupID, "openai_no_available")
+		if refreshErr != nil {
+			slog.Warn("openai scheduler snapshot self-heal failed",
+				"group_id", derefGroupID(groupID),
+				"model", requestedModel,
+				"err", refreshErr)
+		} else if refreshed {
+			slog.Warn("openai scheduler snapshot self-heal retry",
+				"group_id", derefGroupID(groupID),
+				"model", requestedModel)
+			retrySelection, retryDecision, retryErr := scheduler.Select(ctx, req)
+			if retryErr == nil {
+				return retrySelection, retryDecision, nil
+			}
+			selection, decision, err = retrySelection, retryDecision, retryErr
+			if ctx.Err() != nil {
+				return selection, decision, err
+			}
+		}
 	}
 
-	slog.Warn("openai scheduler snapshot self-heal retry",
-		"group_id", derefGroupID(groupID),
-		"model", requestedModel)
-	return scheduler.Select(ctx, req)
+	// 基础设施错误（context 取消污染 / 缓存读失败 / DB 兜底受限 / 缓存未就绪），
+	// 或自愈后仍 ErrNoAvailableAccounts，且父 ctx 仍存活：
+	// 绕过可能被污染或过期的 scheduler snapshot，回退到直连 DB 的普通 load-aware 选路。
+	if isRecoverableSchedulerInfraError(err) || errors.Is(err, ErrNoAvailableAccounts) {
+		fallbackSelection, fallbackErr := s.selectViaLoadAwareLoop(
+			contextWithForceDirectDBList(ctx),
+			groupID, sessionHash, requestedModel, excludedIDs,
+			requiredTransport, requiredCapability, requiredImageCapability, requireCompact)
+		if fallbackErr == nil && fallbackSelection != nil && fallbackSelection.Account != nil {
+			slog.Warn("openai scheduler falling back to load-aware DB selection",
+				"group_id", derefGroupID(groupID),
+				"model", requestedModel,
+				"err", err)
+			decision.Layer = openAIAccountScheduleLayerLoadBalance
+			return fallbackSelection, decision, nil
+		}
+	}
+
+	return selection, decision, err
+}
+
+// selectViaLoadAwareLoop 走普通的 load-aware 选账号循环（与高级调度未启用时一致），
+// 反复排除不兼容/不可用账号直到选到合适的或耗尽候选。它也被高级调度路径在快照失败时复用作为直连 DB 回退。
+func (s *OpenAIGatewayService) selectViaLoadAwareLoop(
+	ctx context.Context,
+	groupID *int64,
+	sessionHash string,
+	requestedModel string,
+	excludedIDs map[int64]struct{},
+	requiredTransport OpenAIUpstreamTransport,
+	requiredCapability OpenAIEndpointCapability,
+	requiredImageCapability OpenAIImagesCapability,
+	requireCompact bool,
+) (*AccountSelectionResult, error) {
+	// Any / HTTPSSE 传输无需额外的传输兼容校验（与原 scheduler==nil 分支保持一致）。
+	skipTransportCheck := requiredTransport == OpenAIUpstreamTransportAny || requiredTransport == OpenAIUpstreamTransportHTTPSSE
+	effectiveExcludedIDs := cloneExcludedAccountIDs(excludedIDs)
+	for {
+		selection, err := s.selectAccountWithLoadAwareness(ctx, groupID, sessionHash, requestedModel, effectiveExcludedIDs, requireCompact, requiredCapability)
+		if err != nil {
+			return nil, err
+		}
+		if selection == nil || selection.Account == nil {
+			return selection, nil
+		}
+		transportOK := skipTransportCheck || s.isOpenAIAccountTransportCompatible(selection.Account, requiredTransport)
+		if transportOK && accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) {
+			return selection, nil
+		}
+		if selection.ReleaseFunc != nil {
+			selection.ReleaseFunc()
+		}
+		if effectiveExcludedIDs == nil {
+			effectiveExcludedIDs = make(map[int64]struct{})
+		}
+		if _, exists := effectiveExcludedIDs[selection.Account.ID]; exists {
+			return nil, ErrNoAvailableAccounts
+		}
+		effectiveExcludedIDs[selection.Account.ID] = struct{}{}
+	}
+}
+
+// isRecoverableSchedulerInfraError 判断 scheduler.Select 返回的错误是否属于
+// 「基础设施层」失败（而非真正无可用账号）——这类错误在父请求 ctx 仍存活时，
+// 应回退到直连 DB 的普通选路，而不是直接判定选账号失败。
+func isRecoverableSchedulerInfraError(err error) bool {
+	if err == nil || errors.Is(err, ErrNoAvailableAccounts) {
+		return false
+	}
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrSchedulerCacheNotReady) ||
+		errors.Is(err, ErrSchedulerFallbackLimited)
+}
+
+// forceDirectDBListContextKey 标记当前选账号应绕过 scheduler snapshot、直连 DB 列举可调度账号。
+// 仅在快照路径失败后的回退选路中设置，避免被污染/过期的快照把账号选择持续打死。
+type forceDirectDBListContextKey struct{}
+
+func contextWithForceDirectDBList(ctx context.Context) context.Context {
+	return context.WithValue(ctx, forceDirectDBListContextKey{}, true)
+}
+
+func forceDirectDBListFromContext(ctx context.Context) bool {
+	v, _ := ctx.Value(forceDirectDBListContextKey{}).(bool)
+	return v
 }
 
 func accountSupportsOpenAICapabilities(account *Account, requiredCapability OpenAIEndpointCapability, requiredImageCapability OpenAIImagesCapability) bool {

@@ -2141,10 +2141,17 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 }
 
 func (s *OpenAIGatewayService) listSchedulableAccounts(ctx context.Context, groupID *int64) ([]Account, error) {
-	if s.schedulerSnapshot != nil {
+	// forceDirectDBList 在快照/缓存读失败或被取消污染时由选账号回退路径设置，
+	// 用于绕过可能被污染或过期的 scheduler snapshot，直连 DB 取可调度账号。
+	if s.schedulerSnapshot != nil && !forceDirectDBListFromContext(ctx) {
 		accounts, _, err := s.schedulerSnapshot.ListSchedulableAccounts(ctx, groupID, PlatformOpenAI, false)
 		return accounts, err
 	}
+	return s.listSchedulableAccountsFromDB(ctx, groupID)
+}
+
+// listSchedulableAccountsFromDB 直连 accountRepo 读取可调度的 OpenAI 账号，完全绕过 scheduler snapshot。
+func (s *OpenAIGatewayService) listSchedulableAccountsFromDB(ctx context.Context, groupID *int64) ([]Account, error) {
 	var accounts []Account
 	var err error
 	if s.cfg != nil && s.cfg.RunMode == config.RunModeSimple {
