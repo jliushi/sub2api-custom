@@ -108,6 +108,23 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_CacheNotReadyFallsBackT
 	require.Equal(t, int64(40402), selection.Account.ID)
 }
 
+// 回退路径必须遵守 excludedIDs（failover 拉黑名单，如刚 502 的账号），
+// 不得绕过排除把脏账号重新选出来。锁死 review Finding 3 的保证。
+func TestOpenAIGatewayService_SelectAccountWithScheduler_FallbackHonorsExcludedIDs(t *testing.T) {
+	groupID := int64(30305)
+	const blacklistedID = int64(40154) // 模拟刚被 502 failover 拉黑的账号
+	const healthyID = int64(40405)
+	stub := &fallbackTestScheduler{selectErr: context.Canceled}
+	svc := newFallbackTestService(t, stub, []Account{fallbackTestAccount(blacklistedID), fallbackTestAccount(healthyID)})
+
+	excluded := map[int64]struct{}{blacklistedID: {}}
+	selection, _, err := svc.SelectAccountWithScheduler(context.Background(), &groupID, "", "session_excluded", "gpt-5.4", excluded, OpenAIUpstreamTransportAny, false)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, healthyID, selection.Account.ID, "回退选路绝不能选中被排除的拉黑账号")
+}
+
 // 父请求 ctx 已取消 → 原样返回错误，不做 DB 回退（客户端已离开）。
 func TestOpenAIGatewayService_SelectAccountWithScheduler_ParentCtxCanceledReturnsError(t *testing.T) {
 	groupID := int64(30303)
