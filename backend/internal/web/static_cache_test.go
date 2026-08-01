@@ -42,6 +42,19 @@ func TestIsFingerprintedEmbeddedAssetPath(t *testing.T) {
 	}
 }
 
+func TestEmbeddedAssetFingerprint(t *testing.T) {
+	t.Parallel()
+
+	dir, extension, fingerprint, ok := embeddedAssetFingerprint("/assets/DateRangePicker-DnLNOoiJ.css")
+	assert.True(t, ok)
+	assert.Equal(t, "assets", dir)
+	assert.Equal(t, ".css", extension)
+	assert.Equal(t, "DnLNOoiJ", fingerprint)
+
+	_, _, _, ok = embeddedAssetFingerprint("/assets/DateRangePicker.css")
+	assert.False(t, ok)
+}
+
 func TestApplyStaticAssetCacheHeaders(t *testing.T) {
 	t.Parallel()
 

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -99,8 +100,22 @@ func (s *FrontendServer) Middleware() gin.HandlerFunc {
 			cleanPath = "index.html"
 		}
 
-		// For index.html or SPA routes, serve with injected settings
-		if cleanPath == "index.html" || !s.fileExists(cleanPath) {
+		// For index.html or SPA routes, serve with injected settings. Hashed
+		// assets are handled separately so a stale browser reference cannot be
+		// answered with index.html (which browsers then reject as CSS/JS).
+		if cleanPath == "index.html" {
+			s.serveIndexHTML(c)
+			return
+		}
+		if !s.fileExists(cleanPath) {
+			if isFingerprintedEmbeddedAssetPath(cleanPath) {
+				if s.tryServeFingerprintAssetAlias(c, cleanPath) {
+					return
+				}
+				c.Status(http.StatusNotFound)
+				c.Abort()
+				return
+			}
 			s.serveIndexHTML(c)
 			return
 		}
@@ -115,6 +130,45 @@ func (s *FrontendServer) Middleware() gin.HandlerFunc {
 		s.fileServer.ServeHTTP(c.Writer, c.Request)
 		c.Abort()
 	}
+}
+
+// tryServeFingerprintAssetAlias serves a missing hashed asset when another
+// embedded asset has the same content fingerprint and extension. This keeps
+// already-open browser tabs working across frontend chunk/component renames,
+// while still returning 404 for genuinely unknown assets.
+func (s *FrontendServer) tryServeFingerprintAssetAlias(c *gin.Context, cleanPath string) bool {
+	return tryServeFingerprintAssetAlias(c, s.distFS, s.fileServer, cleanPath)
+}
+
+func tryServeFingerprintAssetAlias(c *gin.Context, distFS fs.FS, fileServer http.Handler, cleanPath string) bool {
+	dir, extension, fingerprint, ok := embeddedAssetFingerprint(cleanPath)
+	if !ok || distFS == nil || fileServer == nil {
+		return false
+	}
+
+	entries, err := fs.ReadDir(distFS, dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || path.Ext(entry.Name()) != extension {
+			continue
+		}
+		candidate := path.Join(dir, entry.Name())
+		_, _, candidateFingerprint, candidateOK := embeddedAssetFingerprint(candidate)
+		if !candidateOK || candidateFingerprint != fingerprint || candidate == cleanPath {
+			continue
+		}
+
+		originalPath := c.Request.URL.Path
+		c.Request.URL.Path = "/" + candidate
+		applyStaticAssetCacheHeaders(c.Writer.Header(), candidate)
+		fileServer.ServeHTTP(c.Writer, c.Request)
+		c.Request.URL.Path = originalPath
+		c.Abort()
+		return true
+	}
+	return false
 }
 
 func (s *FrontendServer) fileExists(path string) bool {
@@ -329,6 +383,14 @@ func ServeEmbeddedFrontend() gin.HandlerFunc {
 			}
 			applyStaticAssetCacheHeaders(c.Writer.Header(), cleanPath)
 			fileServer.ServeHTTP(c.Writer, c.Request)
+			c.Abort()
+			return
+		}
+		if isFingerprintedEmbeddedAssetPath(cleanPath) {
+			if tryServeFingerprintAssetAlias(c, distFS, fileServer, cleanPath) {
+				return
+			}
+			c.Status(http.StatusNotFound)
 			c.Abort()
 			return
 		}

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -676,6 +677,48 @@ func TestFrontendServer_Middleware(t *testing.T) {
 		assert.Equal(t, http.StatusOK, assetWriter.Code)
 		assert.Equal(t, staticAssetsCacheControl, assetWriter.Header().Get("Cache-Control"))
 	})
+}
+
+func TestFrontendServer_ServesFingerprintAssetAlias(t *testing.T) {
+	provider := &mockSettingsProvider{
+		settings: map[string]string{"test": "value"},
+	}
+
+	server, err := NewFrontendServer(provider)
+	require.NoError(t, err)
+
+	entries, err := fs.ReadDir(server.distFS, "assets")
+	require.NoError(t, err)
+	currentAsset := ""
+	for _, entry := range entries {
+		candidate := "assets/" + entry.Name()
+		if entry.IsDir() || path.Ext(candidate) != ".css" || !isFingerprintedEmbeddedAssetPath(candidate) {
+			continue
+		}
+		currentAsset = candidate
+		break
+	}
+	require.NotEmpty(t, currentAsset)
+
+	_, extension, fingerprint, ok := embeddedAssetFingerprint(currentAsset)
+	require.True(t, ok)
+	legacyPath := "assets/legacy-component-" + fingerprint + extension
+	require.NotEqual(t, currentAsset, legacyPath)
+
+	router := gin.New()
+	router.Use(server.Middleware())
+
+	aliasWriter := httptest.NewRecorder()
+	aliasRequest := httptest.NewRequest(http.MethodGet, "/"+legacyPath, nil)
+	router.ServeHTTP(aliasWriter, aliasRequest)
+	assert.Equal(t, http.StatusOK, aliasWriter.Code)
+	assert.Contains(t, aliasWriter.Header().Get("Content-Type"), "text/css")
+	assert.Equal(t, staticAssetsCacheControl, aliasWriter.Header().Get("Cache-Control"))
+
+	missingWriter := httptest.NewRecorder()
+	missingRequest := httptest.NewRequest(http.MethodGet, "/assets/missing-12345678.css", nil)
+	router.ServeHTTP(missingWriter, missingRequest)
+	assert.Equal(t, http.StatusNotFound, missingWriter.Code)
 }
 
 func TestEmbeddedFrontendBypassesBareVideoAPIRoutes(t *testing.T) {
