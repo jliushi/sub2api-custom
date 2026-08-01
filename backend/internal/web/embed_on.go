@@ -100,16 +100,16 @@ func (s *FrontendServer) Middleware() gin.HandlerFunc {
 			cleanPath = "index.html"
 		}
 
-		// For index.html or SPA routes, serve with injected settings. Hashed
-		// assets are handled separately so a stale browser reference cannot be
+		// For index.html or SPA routes, serve with injected settings. Asset
+		// requests are handled separately so a stale browser reference cannot be
 		// answered with index.html (which browsers then reject as CSS/JS).
 		if cleanPath == "index.html" {
 			s.serveIndexHTML(c)
 			return
 		}
 		if !s.fileExists(cleanPath) {
-			if isFingerprintedEmbeddedAssetPath(cleanPath) {
-				if s.tryServeFingerprintAssetAlias(c, cleanPath) {
+			if isEmbeddedAssetPath(cleanPath) {
+				if isFingerprintedEmbeddedAssetPath(cleanPath) && s.tryServeFingerprintAssetAlias(c, cleanPath) {
 					return
 				}
 				c.Status(http.StatusNotFound)

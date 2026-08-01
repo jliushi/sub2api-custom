@@ -651,11 +651,11 @@ func TestFrontendServer_Middleware(t *testing.T) {
 
 		// Request for existing static file
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/logo.png", nil)
+		req := httptest.NewRequest(http.MethodGet, "/logo.svg", nil)
 		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		assert.Contains(t, w.Header().Get("Content-Type"), "image/png")
+		assert.Contains(t, w.Header().Get("Content-Type"), "image/svg+xml")
 		assert.Empty(t, w.Header().Get("Cache-Control"))
 
 		entries, err := fs.ReadDir(server.distFS, "assets")
@@ -719,6 +719,21 @@ func TestFrontendServer_ServesFingerprintAssetAlias(t *testing.T) {
 	missingRequest := httptest.NewRequest(http.MethodGet, "/assets/missing-12345678.css", nil)
 	router.ServeHTTP(missingWriter, missingRequest)
 	assert.Equal(t, http.StatusNotFound, missingWriter.Code)
+
+	for _, missingPath := range []string{
+		"/assets/missing-component.css",
+		"/assets/missing-component.js",
+		"/assets/missing-font.woff2",
+	} {
+		t.Run(missingPath, func(t *testing.T) {
+			missingWriter := httptest.NewRecorder()
+			missingRequest := httptest.NewRequest(http.MethodGet, missingPath, nil)
+			router.ServeHTTP(missingWriter, missingRequest)
+
+			assert.Equal(t, http.StatusNotFound, missingWriter.Code)
+			assert.NotContains(t, missingWriter.Header().Get("Content-Type"), "text/html")
+		})
+	}
 }
 
 func TestEmbeddedFrontendBypassesBareVideoAPIRoutes(t *testing.T) {
@@ -778,11 +793,11 @@ func TestServeEmbeddedFrontend(t *testing.T) {
 		router.Use(middleware)
 
 		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/logo.png", nil)
+		req := httptest.NewRequest(http.MethodGet, "/logo.svg", nil)
 		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code)
-		assert.Contains(t, w.Header().Get("Content-Type"), "image/png")
+		assert.Contains(t, w.Header().Get("Content-Type"), "image/svg+xml")
 	})
 
 	t.Run("serves_index_html_for_root", func(t *testing.T) {

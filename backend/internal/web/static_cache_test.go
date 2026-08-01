@@ -42,6 +42,30 @@ func TestIsFingerprintedEmbeddedAssetPath(t *testing.T) {
 	}
 }
 
+func TestIsEmbeddedAssetPath(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "asset", path: "assets/app.css", want: true},
+		{name: "fingerprinted_asset", path: "/assets/app-a1B2c3D4.js", want: true},
+		{name: "nested_asset", path: "assets/fonts/inter.woff2", want: true},
+		{name: "assets_directory_without_slash", path: "assets", want: false},
+		{name: "spa_route", path: "admin/settings", want: false},
+		{name: "similar_name", path: "assets-backup/app.css", want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, isEmbeddedAssetPath(tc.path))
+		})
+	}
+}
+
 func TestEmbeddedAssetFingerprint(t *testing.T) {
 	t.Parallel()
 
