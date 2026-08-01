@@ -54,10 +54,15 @@ func newFallbackTestService(t *testing.T, scheduler OpenAIAccountScheduler, acco
 	}
 	snapshotCache := &openAISnapshotCacheStub{accountsByID: accountsByID}
 	snapshotService := &SchedulerSnapshotService{cache: snapshotCache}
+	cfg := &config.Config{}
+	// This repository stub does not model account-to-group membership. Simple
+	// mode makes the fallback test exercise the direct-DB path without relying
+	// on that unrelated persistence detail.
+	cfg.RunMode = config.RunModeSimple
 	svc := &OpenAIGatewayService{
 		accountRepo:        accountRepo,
 		cache:              &schedulerTestGatewayCache{},
-		cfg:                &config.Config{},
+		cfg:                cfg,
 		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
 		schedulerSnapshot:  snapshotService,
 		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{}),

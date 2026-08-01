@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	apiKeyAuthSnapshotVersion = 12 // v12: exclusive group auth fields and local-first billing overlay
+	apiKeyAuthSnapshotVersion = 17 // v17: include the OpenAI group Live gate
 	// 以下为认证 DB 超时/熔断的默认值,可被 config(APIKeyAuthCacheConfig)覆盖。
 	apiKeyAuthDBQueryTimeout      = 500 * time.Millisecond
 	defaultAuthCBFailureThreshold = 5
@@ -113,32 +113,119 @@ func (c apiKeyAuthCacheConfig) jitterTTL(ttl time.Duration) time.Duration {
 
 func (s *APIKeyService) initAuthCache(cfg *config.Config) {
 	s.authCfg = newAPIKeyAuthCacheConfig(cfg)
-	if !s.authCfg.l1Enabled() {
-		return
+	if s.authCfg.negativeEnabled() {
+		negativeSize := defaultNegativeAuthCacheSize
+		if s.authCfg.l1Size > 0 && s.authCfg.l1Size < negativeSize {
+			negativeSize = s.authCfg.l1Size
+		}
+		cache, err := ristretto.NewCache(&ristretto.Config{
+			NumCounters: int64(negativeSize) * 10,
+			MaxCost:     int64(negativeSize),
+			BufferItems: 64,
+		})
+		if err == nil {
+			s.authNegativeCacheL1 = cache
+		}
 	}
-	cache, err := ristretto.NewCache(&ristretto.Config{
-		NumCounters: int64(s.authCfg.l1Size) * 10,
-		MaxCost:     int64(s.authCfg.l1Size),
-		BufferItems: 64,
-	})
-	if err != nil {
-		return
+	if s.authCfg.l1Enabled() {
+		cache, err := ristretto.NewCache(&ristretto.Config{
+			NumCounters: int64(s.authCfg.l1Size) * 10,
+			MaxCost:     int64(s.authCfg.l1Size),
+			BufferItems: 64,
+		})
+		if err == nil {
+			s.authCacheL1 = cache
+		}
 	}
-	s.authCacheL1 = cache
 }
 
 // StartAuthCacheInvalidationSubscriber starts the Pub/Sub subscriber for L1 cache invalidation.
 // This should be called after the service is fully initialized.
 func (s *APIKeyService) StartAuthCacheInvalidationSubscriber(ctx context.Context) {
-	if s.cache == nil || s.authCacheL1 == nil {
+	if s.cache == nil || (s.authCacheL1 == nil && s.authNegativeCacheL1 == nil) {
 		return
 	}
-	if err := s.cache.SubscribeAuthCacheInvalidation(ctx, func(cacheKey string) {
-		s.authCacheL1.Del(cacheKey)
-	}); err != nil {
-		// Log but don't fail - L1 cache will still work, just without cross-instance invalidation
-		slog.Warn("failed to start auth cache invalidation subscriber", "error", err)
+	s.authInvalidationStart.Do(func() {
+		subscriberCtx, cancel := context.WithCancel(ctx)
+		subscriberCtx = withAuthCacheSubscriptionReady(subscriberCtx, func() {
+			s.authInvalidationConnected.Store(true)
+		})
+		s.authInvalidationCancel = cancel
+		s.authInvalidationWG.Add(1)
+		go func() {
+			defer s.authInvalidationWG.Done()
+			backoff := time.Second
+			for {
+				err := s.cache.SubscribeAuthCacheInvalidation(subscriberCtx, func(cacheKey string) {
+					s.invalidateLocalAuthCache(cacheKey)
+				})
+				wasConnected := s.authInvalidationConnected.Swap(false)
+				if subscriberCtx.Err() != nil {
+					return
+				}
+				if wasConnected {
+					backoff = time.Second
+				}
+				s.authInvalidationFailures.Add(1)
+				if err == nil {
+					err = errors.New("auth cache invalidation subscription closed")
+				}
+				slog.Warn("failed to start auth cache invalidation subscriber; retrying", "error", err, "retry_in", backoff)
+				timer := time.NewTimer(backoff)
+				select {
+				case <-subscriberCtx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				if backoff < 30*time.Second {
+					backoff *= 2
+					if backoff > 30*time.Second {
+						backoff = 30 * time.Second
+					}
+				}
+			}
+		}()
+	})
+}
+
+func (s *APIKeyService) invalidateLocalAuthCache(cacheKey string) {
+	if s == nil {
+		return
 	}
+	if s.authCacheL1 != nil {
+		s.authCacheL1.Del(cacheKey)
+	}
+	if s.authNegativeCacheL1 != nil {
+		s.authNegativeCacheL1.Del(cacheKey)
+	}
+}
+
+type AuthCacheInvalidationSubscriberHealth struct {
+	Connected bool   `json:"connected"`
+	Failures  uint64 `json:"failures"`
+}
+
+func (s *APIKeyService) AuthCacheInvalidationSubscriberHealth() AuthCacheInvalidationSubscriberHealth {
+	if s == nil {
+		return AuthCacheInvalidationSubscriberHealth{}
+	}
+	return AuthCacheInvalidationSubscriberHealth{
+		Connected: s.authInvalidationConnected.Load(),
+		Failures:  s.authInvalidationFailures.Load(),
+	}
+}
+
+func (s *APIKeyService) StopAuthCacheInvalidationSubscriber() {
+	if s == nil {
+		return
+	}
+	s.authInvalidationStop.Do(func() {
+		if s.authInvalidationCancel != nil {
+			s.authInvalidationCancel()
+		}
+		s.authInvalidationWG.Wait()
+	})
 }
 
 func (s *APIKeyService) authCacheKey(key string) string {
@@ -150,6 +237,13 @@ func (s *APIKeyService) getAuthCacheEntry(ctx context.Context, cacheKey string) 
 	if s.authCacheL1 != nil {
 		if val, ok := s.authCacheL1.Get(cacheKey); ok {
 			if entry, ok := val.(*APIKeyAuthCacheEntry); ok {
+				return entry, true
+			}
+		}
+	}
+	if s.authNegativeCacheL1 != nil {
+		if val, ok := s.authNegativeCacheL1.Get(cacheKey); ok {
+			if entry, ok := val.(*APIKeyAuthCacheEntry); ok && entry.NotFound {
 				return entry, true
 			}
 		}
@@ -166,13 +260,19 @@ func (s *APIKeyService) getAuthCacheEntry(ctx context.Context, cacheKey string) 
 }
 
 func (s *APIKeyService) setAuthCacheL1(cacheKey string, entry *APIKeyAuthCacheEntry) {
-	if s.authCacheL1 == nil || entry == nil {
+	if entry == nil {
+		return
+	}
+	if entry.NotFound {
+		if s.authNegativeCacheL1 != nil && s.authCfg.negativeTTL > 0 {
+			_ = s.authNegativeCacheL1.SetWithTTL(cacheKey, entry, 1, s.authCfg.jitterTTL(s.authCfg.negativeTTL))
+		}
+		return
+	}
+	if s.authCacheL1 == nil {
 		return
 	}
 	ttl := s.authCfg.l1TTL
-	if entry.NotFound && s.authCfg.negativeTTL > 0 && s.authCfg.negativeTTL < ttl {
-		ttl = s.authCfg.negativeTTL
-	}
 	ttl = s.authCfg.jitterTTL(ttl)
 	_ = s.authCacheL1.SetWithTTL(cacheKey, entry, 1, ttl)
 }
@@ -191,6 +291,9 @@ func (s *APIKeyService) setAuthCacheEntry(ctx context.Context, cacheKey string, 
 func (s *APIKeyService) deleteAuthCache(ctx context.Context, cacheKey string) {
 	if s.authCacheL1 != nil {
 		s.authCacheL1.Del(cacheKey)
+	}
+	if s.authNegativeCacheL1 != nil {
+		s.authNegativeCacheL1.Del(cacheKey)
 	}
 	if s.cache == nil {
 		return
@@ -213,9 +316,9 @@ func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey st
 	var dbErr error
 	var apiKey *APIKey
 	if s.dbCircuitBreaker != nil {
-		err := s.dbCircuitBreaker.Call(func() error {
+		breakerErr := s.dbCircuitBreaker.Call(func() error {
 			var e error
-			apiKey, e = s.apiKeyRepo.GetByKeyForAuth(queryCtx, key)
+			apiKey, e = s.lookupAPIKeyForAuth(queryCtx, key)
 			dbErr = e
 			// NotFound is a valid auth result; transient DB failures trip the breaker.
 			if e != nil && !errors.Is(e, ErrAPIKeyNotFound) && isTimeoutOrConnectionError(e) {
@@ -224,21 +327,27 @@ func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey st
 			return nil
 		})
 		// Circuit breaker rejected the request (open state)
-		if err == circuitbreaker.ErrCircuitOpen {
+		if breakerErr == circuitbreaker.ErrCircuitOpen {
 			if stale := s.getStaleCacheEntry(ctx, cacheKey); stale != nil {
 				return stale, nil
 			}
 			return nil, fmt.Errorf("circuit breaker open and no stale cache available")
 		}
+		if breakerErr != nil && dbErr == nil {
+			dbErr = breakerErr
+		}
 	} else {
-		apiKey, dbErr = s.apiKeyRepo.GetByKeyForAuth(queryCtx, key)
+		apiKey, dbErr = s.lookupAPIKeyForAuth(queryCtx, key)
 	}
 
 	if dbErr != nil {
 		if errors.Is(dbErr, ErrAPIKeyNotFound) {
 			entry := &APIKeyAuthCacheEntry{NotFound: true}
 			if s.authCfg.negativeEnabled() {
-				s.setAuthCacheEntry(ctx, cacheKey, entry, s.authCfg.negativeTTL)
+				// Invalid keys are attacker-controlled and high-cardinality. Keep their
+				// negative entries in the bounded process-local cache; do not amplify
+				// random-key scans into Redis writes on every instance.
+				s.setAuthCacheL1(cacheKey, entry)
 			}
 			return entry, nil
 		}
@@ -264,6 +373,30 @@ func (s *APIKeyService) loadAuthCacheEntry(ctx context.Context, key, cacheKey st
 	s.applyLocalBillingOverlay(ctx, snapshot)
 	s.setAuthCacheEntry(ctx, cacheKey, entry, s.authCfg.l2TTL)
 	return entry, nil
+}
+
+func (s *APIKeyService) lookupAPIKeyForAuth(ctx context.Context, key string) (*APIKey, error) {
+	if s == nil || s.apiKeyRepo == nil {
+		return nil, ErrAPIKeyNotFound
+	}
+	if s.authLookupSlots == nil {
+		return s.apiKeyRepo.GetByKeyForAuth(ctx, key)
+	}
+	s.authLookupTotal.Add(1)
+	select {
+	case s.authLookupSlots <- struct{}{}:
+		s.authLookupInFlight.Add(1)
+		defer func() {
+			s.authLookupInFlight.Add(-1)
+			<-s.authLookupSlots
+		}()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+		s.authLookupRejected.Add(1)
+		return nil, ErrAPIKeyAuthOverloaded
+	}
+	return s.apiKeyRepo.GetByKeyForAuth(ctx, key)
 }
 
 func (s *APIKeyService) applyAuthCacheEntry(key string, entry *APIKeyAuthCacheEntry) (*APIKey, bool, error) {
@@ -340,11 +473,18 @@ func (s *APIKeyService) snapshotFromAPIKey(ctx context.Context, apiKey *APIKey) 
 			WeeklyLimitUSD:                  apiKey.Group.WeeklyLimitUSD,
 			MonthlyLimitUSD:                 apiKey.Group.MonthlyLimitUSD,
 			AllowImageGeneration:            apiKey.Group.AllowImageGeneration,
+			AllowBatchImageGeneration:       apiKey.Group.AllowBatchImageGeneration,
 			ImageRateIndependent:            apiKey.Group.ImageRateIndependent,
 			ImageRateMultiplier:             apiKey.Group.ImageRateMultiplier,
 			ImagePrice1K:                    apiKey.Group.ImagePrice1K,
 			ImagePrice2K:                    apiKey.Group.ImagePrice2K,
 			ImagePrice4K:                    apiKey.Group.ImagePrice4K,
+			VideoRateIndependent:            apiKey.Group.VideoRateIndependent,
+			VideoRateMultiplier:             apiKey.Group.VideoRateMultiplier,
+			VideoPrice480P:                  apiKey.Group.VideoPrice480P,
+			VideoPrice720P:                  apiKey.Group.VideoPrice720P,
+			VideoPrice1080P:                 apiKey.Group.VideoPrice1080P,
+			WebSearchPricePerCall:           apiKey.Group.WebSearchPricePerCall,
 			ClaudeCodeOnly:                  apiKey.Group.ClaudeCodeOnly,
 			FallbackGroupID:                 apiKey.Group.FallbackGroupID,
 			FallbackGroupIDOnInvalidRequest: apiKey.Group.FallbackGroupIDOnInvalidRequest,
@@ -353,10 +493,17 @@ func (s *APIKeyService) snapshotFromAPIKey(ctx context.Context, apiKey *APIKey) 
 			MCPXMLInject:                    apiKey.Group.MCPXMLInject,
 			SupportedModelScopes:            apiKey.Group.SupportedModelScopes,
 			AllowMessagesDispatch:           apiKey.Group.AllowMessagesDispatch,
+			AllowLive:                       apiKey.Group.AllowLive,
 			DefaultMappedModel:              apiKey.Group.DefaultMappedModel,
 			MessagesDispatchModelConfig:     apiKey.Group.MessagesDispatchModelConfig,
 			ModelsListConfig:                apiKey.Group.ModelsListConfig,
 			RPMLimit:                        apiKey.Group.RPMLimit,
+			MaxReasoningEffort:              apiKey.Group.MaxReasoningEffort,
+			ReasoningEffortMappings:         apiKey.Group.ReasoningEffortMappings,
+			PeakRateEnabled:                 apiKey.Group.PeakRateEnabled,
+			PeakStart:                       apiKey.Group.PeakStart,
+			PeakEnd:                         apiKey.Group.PeakEnd,
+			PeakRateMultiplier:              apiKey.Group.PeakRateMultiplier,
 		}
 	}
 	return snapshot
@@ -413,11 +560,18 @@ func (s *APIKeyService) snapshotToAPIKey(key string, snapshot *APIKeyAuthSnapsho
 			WeeklyLimitUSD:                  snapshot.Group.WeeklyLimitUSD,
 			MonthlyLimitUSD:                 snapshot.Group.MonthlyLimitUSD,
 			AllowImageGeneration:            snapshot.Group.AllowImageGeneration,
+			AllowBatchImageGeneration:       snapshot.Group.AllowBatchImageGeneration,
 			ImageRateIndependent:            snapshot.Group.ImageRateIndependent,
 			ImageRateMultiplier:             snapshot.Group.ImageRateMultiplier,
 			ImagePrice1K:                    snapshot.Group.ImagePrice1K,
 			ImagePrice2K:                    snapshot.Group.ImagePrice2K,
 			ImagePrice4K:                    snapshot.Group.ImagePrice4K,
+			VideoRateIndependent:            snapshot.Group.VideoRateIndependent,
+			VideoRateMultiplier:             snapshot.Group.VideoRateMultiplier,
+			VideoPrice480P:                  snapshot.Group.VideoPrice480P,
+			VideoPrice720P:                  snapshot.Group.VideoPrice720P,
+			VideoPrice1080P:                 snapshot.Group.VideoPrice1080P,
+			WebSearchPricePerCall:           snapshot.Group.WebSearchPricePerCall,
 			ClaudeCodeOnly:                  snapshot.Group.ClaudeCodeOnly,
 			FallbackGroupID:                 snapshot.Group.FallbackGroupID,
 			FallbackGroupIDOnInvalidRequest: snapshot.Group.FallbackGroupIDOnInvalidRequest,
@@ -426,10 +580,17 @@ func (s *APIKeyService) snapshotToAPIKey(key string, snapshot *APIKeyAuthSnapsho
 			MCPXMLInject:                    snapshot.Group.MCPXMLInject,
 			SupportedModelScopes:            snapshot.Group.SupportedModelScopes,
 			AllowMessagesDispatch:           snapshot.Group.AllowMessagesDispatch,
+			AllowLive:                       snapshot.Group.AllowLive,
 			DefaultMappedModel:              snapshot.Group.DefaultMappedModel,
 			MessagesDispatchModelConfig:     snapshot.Group.MessagesDispatchModelConfig,
 			ModelsListConfig:                snapshot.Group.ModelsListConfig,
 			RPMLimit:                        snapshot.Group.RPMLimit,
+			MaxReasoningEffort:              snapshot.Group.MaxReasoningEffort,
+			ReasoningEffortMappings:         snapshot.Group.ReasoningEffortMappings,
+			PeakRateEnabled:                 snapshot.Group.PeakRateEnabled,
+			PeakStart:                       snapshot.Group.PeakStart,
+			PeakEnd:                         snapshot.Group.PeakEnd,
+			PeakRateMultiplier:              snapshot.Group.PeakRateMultiplier,
 		}
 	}
 	s.compileAPIKeyIPRules(apiKey)
