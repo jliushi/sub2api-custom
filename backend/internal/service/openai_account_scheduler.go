@@ -2226,7 +2226,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	// 或自愈后仍 ErrNoAvailableAccounts，且父 ctx 仍存活：
 	// 绕过可能被污染或过期的 scheduler snapshot，回退到直连 DB 的普通 load-aware 选路。
 	if isRecoverableSchedulerInfraError(err) || errors.Is(err, ErrNoAvailableAccounts) {
-	fallbackSelection, fallbackErr := s.selectViaLoadAwareLoop(
+		fallbackSelection, fallbackErr := s.selectViaLoadAwareLoop(
 			contextWithForceDirectDBList(ctx),
 			groupID, platform, sessionHash, requestedModel, excludedIDs,
 			requiredTransport, requiredCapability, requiredImageCapability, requireCompact, useUpstreamTokenCost)
