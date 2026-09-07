@@ -8621,10 +8621,6 @@ func applyUsageBilling(ctx context.Context, requestID string, usageLog *UsageLog
 	return true, nil
 }
 
-func finalizePostUsageBilling(ctx context.Context, p *postUsageBillingParams, deps *billingDeps, result *UsageBillingApplyResult) {
-	finalizePostUsageBillingWithOptions(ctx, p, deps, result, true)
-}
-
 func finalizePostUsageBillingWithOptions(ctx context.Context, p *postUsageBillingParams, deps *billingDeps, result *UsageBillingApplyResult, adjustAuthCache bool) {
 	if p == nil || p.Cost == nil || deps == nil {
 		return

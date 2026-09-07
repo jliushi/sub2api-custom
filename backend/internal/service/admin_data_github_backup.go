@@ -519,7 +519,7 @@ func collectAdminDataTable(ctx context.Context, tx *sql.Tx, tableName string) (*
 	if err != nil {
 		return nil, fmt.Errorf("query table %s: %w", tableName, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	table := &adminDataBackupTable{
 		Name:    tableName,
@@ -548,7 +548,7 @@ func adminDataTableColumns(ctx context.Context, tx *sql.Tx, tableName string) ([
 	if err != nil {
 		return nil, fmt.Errorf("load columns for %s: %w", tableName, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var columns []string
 	for rows.Next() {
@@ -663,7 +663,7 @@ func (s *AdminDataGitHubBackupService) downloadFile(ctx context.Context, path st
 	if err != nil {
 		return nil, "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, "", errAdminDataGitHubNotFound
 	}
@@ -713,7 +713,7 @@ func (s *AdminDataGitHubBackupService) uploadFile(ctx context.Context, path stri
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("GitHub upload failed path=%s status=%d body=%s", path, resp.StatusCode, strings.TrimSpace(string(respBody)))
@@ -816,7 +816,7 @@ func gunzipAdminDataBytes(in []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer zr.Close()
+	defer func() { _ = zr.Close() }()
 	return io.ReadAll(zr)
 }
 

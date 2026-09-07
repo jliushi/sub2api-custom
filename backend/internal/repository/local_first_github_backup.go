@@ -255,7 +255,7 @@ func (l *localFirstLedger) collectUsageBackupEvents(ctx context.Context, snapsho
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var ev localFirstUsageBackupEvent
 		if err := rows.Scan(&ev.RequestID, &ev.APIKeyID, &ev.Payload, &ev.PreviousStatus, &ev.CreatedAt, &ev.LastError, &ev.LastAttemptAt, &ev.FailedAt); err != nil {
@@ -281,7 +281,7 @@ func (l *localFirstLedger) collectBillingBackupEvents(ctx context.Context, snaps
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var ev localFirstBillingBackupEvent
 		if err := rows.Scan(&ev.RequestID, &ev.APIKeyID, &ev.UserID, &ev.Fingerprint, &ev.Payload, &ev.PreviousStatus, &ev.CreatedAt, &ev.LastError, &ev.LastAttemptAt, &ev.FailedAt); err != nil {
@@ -380,7 +380,7 @@ func (b *localFirstGitHubBackup) download(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, errLocalFirstGitHubBackupNotFound
 	}
@@ -430,7 +430,7 @@ func (b *localFirstGitHubBackup) upload(ctx context.Context, encrypted []byte, s
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("GitHub upload failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(respBody)))
@@ -448,7 +448,7 @@ func (b *localFirstGitHubBackup) currentSHA(ctx context.Context) (string, error)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
 		return "", errLocalFirstGitHubBackupNotFound
 	}
@@ -558,6 +558,6 @@ func gunzipBytes(in []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer zr.Close()
+	defer func() { _ = zr.Close() }()
 	return io.ReadAll(zr)
 }
